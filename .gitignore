@@ -1,0 +1,20 @@
+# Unreal: caches and build output, recreated on any machine
+ReferenceWorldBuilder/Saved/
+ReferenceWorldBuilder/Intermediate/
+ReferenceWorldBuilder/DerivedDataCache/
+ReferenceWorldBuilder/Binaries/
+# worlds the tool generates from someone's picture (rebuilt on demand)
+ReferenceWorldBuilder/Content/ReferenceWorldBuilder/Generated/
+ReferenceWorldBuilder/Content/ReferenceWorldBuilder/Layers/
+ReferenceWorldBuilder/Content/ReferenceWorldBuilder/Found/
+ReferenceWorldBuilder/Content/Temp/
+# downloaded models and previews (Find model); CC-BY models carry their own terms
+ModelLibrary/_online/
+models/
+# Python
+__pycache__/
+*.pyc
+# helper staging files
+_ps_in.jsx
+_ps_out.txt
+_ps_run.jsx
