@@ -27,6 +27,7 @@ import rwb_generated
 import rwb_layers
 import rwb_layout
 import rwb_library
+import rwb_street
 
 # typical size in cm: ("h", height) or ("w", width for flat things)
 PRIORS = {
@@ -36,6 +37,7 @@ PRIORS = {
     "wall": ("h", 300), "fence": ("h", 110), "bridge": ("w", 700), "gate": ("h", 420), "pillar": ("h", 380),
     "lantern": ("h", 260), "furniture": ("h", 110), "character": ("h", 175), "creature": ("h", 110),
     "prop_card": ("h", 160), "unknown": ("h", 200),
+    "building": ("h", 1500), "sign": ("h", 150), "vehicle": ("h", 150),
 }
 BASE_COUNTS = {
     "tree": 16, "pine": 16, "bush": 12, "thorns": 10, "flower": 24, "grass": 30, "rock": 9, "cliff": 4,
@@ -56,6 +58,34 @@ TOTAL_CAP = 650
 MAX_GENERATED = 60            # models built per picture (largest first)
 MAX_COUNT = 200               # copies of one model the panel may ask for
 _world = {}                   # the last world built this session: lets the panel change it in place
+# what each kind of place does to the world (copied from reference_setting.SETTINGS, which can't be
+# imported here: it needs numpy).  terrain = hilliness, grass = grow it, forest = extra trees around,
+# box = streets and rooms are walled in by the picture itself (rwb_street)
+SETTING_RULES = {
+    "nature": {"terrain": 1.0, "grass": True, "forest": True, "box": False},
+    "city": {"terrain": 0.0, "grass": False, "forest": False, "box": True},
+    "interior": {"terrain": 0.0, "grass": False, "forest": False, "box": True},
+    "desert": {"terrain": 2.2, "grass": False, "forest": False, "box": False},
+    "snow": {"terrain": 1.8, "grass": False, "forest": True, "box": False},
+    "coast": {"terrain": 0.8, "grass": True, "forest": False, "box": False},
+}
+ON_THE_WALLS = {"building"}   # in a street, buildings are the walls themselves
+SIGN_BOARDS = {"sign"}        # built as boards showing their own crop (rwb_street.build_boards)
+
+
+def setting_for(inv, values):
+    """The kind of place to build, and its rules.  The panel's choice beats what was read."""
+    found = dict(inv.get("setting") or {})
+    chosen = str(values.get("setting") or "auto").lower()
+    name = chosen if chosen in SETTING_RULES else found.get("name") or "nature"
+    rules = dict(SETTING_RULES.get(name, SETTING_RULES["nature"]))
+    if name == found.get("name"):
+        rules.update({k: found[k] for k in rules if k in found})
+    rules["name"] = name
+    rules["night"] = bool(found.get("night"))
+    rules["lights"] = list(found.get("lights") or [])
+    rules["layout"] = found.get("layout") or {}
+    return rules
 
 
 def _wb():
@@ -118,14 +148,14 @@ def _sample_grid(grid, u, v):
     return a * (1 - ty) + b * ty
 
 
-def make_terrain(inv, frame, relief, rng, n=96, land=()):
+def make_terrain(inv, frame, relief, rng, n=96, land=(), hilliness=1.0):
     """Heights (row 0 = far edge), water level (or None) and a water mask.
 
     ``land`` = [(x, y, r)]: spots where something was painted standing, kept dry even if the water
     mask reaches them (a tower on an island).
     """
     size = frame.size
-    amp = max(40.0, relief * 0.3)
+    amp = max(40.0, relief * 0.3) * max(0.0, float(hilliness))   # 0 = flat (streets, rooms)
     big, mid, small = _value_noise(n, 4, rng), _value_noise(n, 9, rng), _value_noise(n, 18, rng)
     water_cov = (inv.get("water") or {}).get("coverage")
     hill_cov = (inv.get("hills") or {}).get("coverage")
@@ -1140,7 +1170,7 @@ def _paint_ground(ctx, terrain_actor, surfaces, camera, heights, water_z, inv, c
     job.write_text(json.dumps({
         "camera": _camera_data(camera), "world_size": camera.size, "surfaces": surfaces["surfaces"],
         "cells": surfaces["cells"], "heights": heights, "water_z": water_z, "rock_color": list(rock),
-        "out": str(out)}), encoding="utf-8")
+        "floor": surfaces.get("floor"), "out": str(out)}), encoding="utf-8")
     wb._run_helper(Path(root_dir) / "reference_surfaces.py", ["--job", str(job)], timeout=300,
                    message="Painting the ground from your picture")
     component = (terrain_actor.get_component_by_class(unreal.ProceduralMeshComponent)
@@ -1218,6 +1248,24 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
     name = rwb_layers._safe(analysis.get("name", "ref"), 24)
     cache_dir = (analysis.get("scene") or {}).get("cache") or analysis.get("layer_dir") or "."
     plan = _plan(inv, camera) + _drawn_records(cache_dir, camera)
+    setting = setting_for(inv, values)
+    if not values.get("water", True) and (inv.get("water") or {}).get("present"):
+        inv = dict(inv, water=dict(inv["water"], present=False, line="Water: turned off in the panel"))
+    # signs become boards with their own crisp picture, not meshes built from an outline
+    signs = [r for r in plan if r["category"] in SIGN_BOARDS and r["inst"].get("board") and not r.get("drawn")]
+    plan = [r for r in plan if r not in signs]
+    half = None
+    if setting["box"]:
+        plan = [r for r in plan if r["category"] not in ON_THE_WALLS or r.get("drawn")]
+        half = 650.0
+        for _pass in range(2):            # placed without the depth map, then the street fits around them
+            for record in plan:
+                if record.get("drawn"):
+                    rwb_street.keep_in_street(record["place"], half)
+                else:
+                    rwb_street.replace_in_street(camera, record, half)
+            half = rwb_street.street_half_width([(r["place"]["x"], r["place"]["airborne"] or r["category"] == "sign")
+                                                 for r in plan])
 
     # ---- new 3D models from the painting
     generated = {}
@@ -1259,7 +1307,8 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         if record["category"] not in WATER_OBJECTS and not record["place"]["airborne"]:
             # enough for its base; a wide building mustn't erase the lake it stands in
             land.append((record["place"]["x"], record["place"]["y"], min(380.0, max(120.0, record["place"]["width"] * 0.45))))
-    heights, water_z, water = make_terrain(inv, camera, float(values["height"]), rng, n=128, land=land)
+    heights, water_z, water = make_terrain(inv, camera, float(values["height"]), rng, n=128, land=land,
+                                           hilliness=setting["terrain"])
     terrain_actor = build_terrain_actor(heights, water_z, water, inv, size, rng)
     water_actor = None
     if water_z is not None:
@@ -1267,6 +1316,9 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
     overrides = {k: v for k, v in (("sky", inv.get("sky")), ("fog", inv.get("fog")), ("accent", inv.get("accent")),
                                      ("water", (inv.get("water") or {}).get("color"))) if v}
     wb._lighting(analysis, size, size, heights, overrides)
+    messages.append("Setting: %s%s" % (setting["name"], ", night" if setting["night"] else ""))
+    if setting["night"]:
+        _night_sky()
     ctx = {
         "count": 0, "psd": name, "folder": rwb_layers.LAYER_ROOT + "/" + name, "paint": False, "blend": 0.0,
         "art_blend": float(values.get("art_blend", 1.0)) if values.get("paint_art", True) else 0.0,
@@ -1275,6 +1327,47 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         "shapes": {k: unreal.load_asset(p) for k, p in rwb_layers.SHAPES.items()},
         "placer": Placer(size, heights, water_z, water, (0.0, camera.player_y)),
     }
+    if half is not None:
+        wb._progress_message("Building the street from your picture", 91.0)
+        scene = analysis.get("scene") or {}
+        picture = inv.get("picture_full") if inv.get("picture_full") and Path(inv["picture_full"]).is_file() \
+            else scene.get("texture")
+        top_row = float(scene.get("sky_bottom") or 0.0) * camera.H / float(scene.get("height") or camera.H)
+        blocks = rwb_street.building_blocks(camera, half, (setting.get("layout") or {}).get("sides"), seed)
+        if picture and Path(picture).is_file():
+            if blocks:
+                try:
+                    made = rwb_street.build_buildings(ctx, camera, blocks, picture, cache_dir, setting["night"])
+                    left = sum(1 for b in blocks if b["side"] == "left")
+                    messages.append("street: %d buildings (%d left, %d right), %.0f m apart, fronts painted from your picture"
+                                    % (len(made), left, len(made) - left, 2 * half / 100.0))
+                except Exception as error:
+                    blocks = []
+                    messages.append("could not build the buildings (%s): plain walls instead" % str(error)[:140])
+            try:
+                rwb_street.build(ctx, camera, half, picture, cache_dir, top_row, setting["night"],
+                                 room=setting["name"] == "interior", walls=not blocks)
+                if not blocks:
+                    messages.append("%s: walls %.0f m apart, painted from your picture" % (
+                        "room" if setting["name"] == "interior" else "street", 2 * half / 100.0))
+            except Exception as error:
+                messages.append("could not build the street walls (%s)" % str(error)[:140])
+        if setting["night"] and setting["lights"]:
+            try:
+                lit = rwb_street.add_lights(camera, half, setting["lights"])
+                messages.append("night: %d coloured lights at the glowing signs" % lit)
+            except Exception as error:
+                messages.append("no sign lights (%s)" % str(error)[:120])
+    if signs:
+        wb._progress_message("Hanging %d signs" % len(signs), 91.5)
+        try:
+            kinds = rwb_street.build_boards(ctx, camera, signs, cache_dir, half, setting["night"])
+            if kinds:
+                names = {"blade": "sticking out from the walls", "facade": "flat on the facades", "front": "facing you"}
+                messages.append("signs: %d boards with their own picture (%s)" % (
+                    sum(kinds.values()), ", ".join("%d %s" % (n, names[k]) for k, n in sorted(kinds.items()))))
+        except Exception as error:
+            messages.append("could not hang the signs (%s)" % str(error)[:140])
     surfaces = inv.get("surfaces") or {}
     if surfaces.get("surfaces"):
         try:
@@ -1283,6 +1376,12 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
             messages.append("ground keeps plain colours (%s)" % str(error)[:140])
         if surfaces.get("line"):
             messages.append(surfaces["line"])
+        floor = surfaces.get("floor") or {}
+        if floor.get("share"):
+            messages.append("floor: the ground you painted is pasted onto the terrain where it shows (%d%% of the picture)"
+                            % round(100 * floor["share"]))
+    if (inv.get("water") or {}).get("line"):
+        messages.append(inv["water"]["line"])
     water_tile = (inv.get("water") or {}).get("tile")
     if water_actor and water_tile and Path(water_tile).is_file():
         try:
@@ -1355,7 +1454,7 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
     report += short
 
     # ---- grass grows where the ground is grassy
-    if values.get("grow_grass", True):
+    if values.get("grow_grass", True) and setting["grass"]:
         grown = _grow_grass(ctx, surfaces, camera, library, density, area, rng)
         total += grown
         if grown:
@@ -1380,8 +1479,8 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
             report.append("%s: %d plants where they were painted" % (category, made) if made
                           else "%s: painted, but no 3D model - add one named '%s' to ModelLibrary" % (category, category))
             continue
-        # a forest needs more than the trees it was painted with, even if only one was recognised
-        if not values.get("extra_copies", True) or (obj["unique"] and category not in FOREST):
+        # a forest needs more than the trees it was painted with; outside a street's walls nobody sees them
+        if not values.get("extra_copies", True) or setting["box"] or                 (obj["unique"] and not (category in FOREST and setting["forest"])):
             continue
         extras = by_category.get(category) or []
         if not models and not extras:
@@ -1406,6 +1505,25 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
             "info": inv.get("info", "")}
 
 
+def _night_sky():
+    """A night picture: the sun goes down, and the painted lights do the work."""
+    wb = _wb()
+    for actor in wb._all_actors():
+        if isinstance(actor, unreal.DirectionalLight):
+            component = actor.get_component_by_class(unreal.DirectionalLightComponent)
+            if component:
+                component.set_editor_property("intensity", 0.08)
+            actor.set_actor_rotation(unreal.Rotator(pitch=-6.0, yaw=-28.0), False)
+        elif isinstance(actor, unreal.SkyLight):
+            component = actor.get_component_by_class(unreal.SkyLightComponent)
+            if component:
+                component.set_intensity(0.45)
+                try:
+                    component.recapture_sky()
+                except Exception:
+                    pass
+
+
 def _player_start(frame, heights, size):
     wb = _wb()
     x, y = 0.0, frame.player_y
@@ -1413,7 +1531,7 @@ def _player_start(frame, heights, size):
     location = unreal.Vector(x, y, z)
     starts = [a for a in wb._all_actors() if isinstance(a, unreal.PlayerStart)]
     if starts:
-        starts[0].set_actor_location(location, False)
+        starts[0].set_actor_location(location, False, True)
         starts[0].set_actor_rotation(unreal.Rotator(yaw=-90.0), False)
         return starts[0]
     start = unreal.EditorLevelLibrary.spawn_actor_from_class(unreal.PlayerStart, location, unreal.Rotator(yaw=-90.0))

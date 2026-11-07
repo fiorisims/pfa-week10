@@ -81,7 +81,7 @@ AREA_CATEGORIES = {"water", "mountain"}
 # these lie on the ground or water, so they cannot be above the horizon
 GROUNDED_CATEGORIES = {"boat", "lily", "bridge"}
 # these may hang or fly above the ground; anything else above the horizon is canopy or backdrop
-AIRBORNE_CATEGORIES = {"floating", "creature", "lantern", "prop_card"}
+AIRBORNE_CATEGORIES = {"floating", "creature", "lantern", "prop_card", "sign"}
 AIRBORNE_MAX_AREA = 0.03  # share of the picture: a floater is small
 HORIZON_SLACK = 0.08      # standing objects may meet the ground this far above the horizon (hidden feet)
 
@@ -315,6 +315,132 @@ class Segmenter:
         cut_h = int(round(self.nh * best.shape[-2] / float(SAM_SIZE)))
         logits = best[:max(1, cut_h), :max(1, cut_w)]
         return _resize(logits, self.W, self.H) > 0.0, best_quality
+
+
+    def points(self, positive, negative=()):
+        """[(bool HxW mask, quality)] for every mask SAM offers for point prompts (image pixels)."""
+        pts = [[x * self.scale, y * self.scale] for x, y in list(positive) + list(negative)]
+        labels = [1] * len(positive) + [0] * len(negative)          # 0 = "this point is not on it"
+        masks, quality = self._decode(pts, labels)
+        out = []
+        for i in range(masks.shape[0]):
+            cut_w = int(round(self.nw * masks.shape[-1] / float(SAM_SIZE)))
+            cut_h = int(round(self.nh * masks.shape[-2] / float(SAM_SIZE)))
+            logits = masks[i][:max(1, cut_h), :max(1, cut_w)]
+            out.append((_resize(logits, self.W, self.H) > 0.0, float(quality[i])))
+        return out
+
+
+FLOOR_VERSION = "rwb-floor-5"
+
+
+def floor_rank(mask, quality, horizon):
+    """How much a mask looks like the floor: it covers the bottom of the picture and stays below the horizon."""
+    H = mask.shape[0]
+    if not mask.any():
+        return 0.0
+    bottom = float(mask[int(0.93 * H):].mean())
+    above = float(mask[:max(1, int(horizon - 0.03 * H))].sum()) / float(mask.sum())
+    return quality * bottom * max(0.0, 1.0 - 2.5 * above)
+
+
+def close_columns(floor, rgb=None, max_gap=0.25, min_run=6, max_colour=0.22):
+    """Seen from a standing eye the floor runs unbroken up each column of the picture until it ends, so a
+    gap with floor above and below it is floor too (a lit patch, a road marking) - if its paint matches
+    the floor on either side of it.  A shop front between the sidewalk and a sliver of floor doesn't.
+    Objects standing there still hide it later.
+    """
+    H, W = floor.shape
+    out = floor.copy()
+    limit = int(max_gap * H)
+    x = None if rgb is None else np.asarray(rgb, np.float32) / 255.0
+    for c in range(W):
+        rows = np.nonzero(floor[:, c])[0]
+        if len(rows) < 2 * min_run:
+            continue
+        for g in np.nonzero(np.diff(rows) > 1)[0]:
+            top, bottom = rows[g], rows[g + 1]
+            above = np.sum((rows <= top) & (rows > top - min_run * 2))
+            if bottom - top - 1 > limit or above < min_run:
+                continue
+            if x is not None:
+                edge = np.concatenate([x[max(0, top - 4):top + 1, c], x[bottom:bottom + 5, c]])
+                gap = x[top + 1:bottom, c]
+                if np.linalg.norm(np.median(gap, 0) - np.median(edge, 0)) > max_colour:
+                    continue
+            out[top:bottom, c] = True
+    return out
+
+
+def grow_floor(rgb, floor, allowed, groups=6, owned=0.55, step=2):
+    """SAM outlines the near floor well and stops early further back.  Colour groups that are mostly floor
+    where SAM saw it are floor wherever they connect to it (below the horizon).
+    """
+    import reference_scene
+    import reference_surfaces
+    if floor.sum() < 50:
+        return floor
+    zone = allowed
+    centres, labels = reference_surfaces.group_colours(rgb[zone], groups=groups)
+    label_map = -np.ones(floor.shape, np.int64)
+    label_map[zone] = labels
+    floorish = np.zeros(floor.shape, bool)
+    for i in range(len(centres)):
+        members = label_map == i
+        if members.any() and float((members & floor).sum()) / float(members.sum()) >= owned:
+            floorish |= members
+    candidates = (floorish | floor)[::step, ::step]
+    seeds = floor[::step, ::step]
+    out = floor.copy()
+    for cells in reference_scene._components(candidates):
+        rows, cols = zip(*cells)
+        if seeds[list(rows), list(cols)].any():
+            grown = np.zeros_like(candidates)
+            grown[list(rows), list(cols)] = True
+            out |= np.repeat(np.repeat(grown, step, 0), step, 1)[:floor.shape[0], :floor.shape[1]] & zone
+    return out
+
+
+def floor_mask(rgb, horizon, cache_dir=None, stamp="", segmenter=None):
+    """The floor (ground, street, sidewalk, room floor) as SAM outlines it, or None.
+
+    Prompted with points along the bottom of the picture and "not this" points on the sky and the
+    upper walls.  The floor may be in pieces (a road and its sidewalk), so each bottom point also asks
+    on its own, and good pieces are joined.
+    """
+    H, W = rgb.shape[:2]
+    cache = Path(cache_dir).resolve() / "floor.npy" if cache_dir else None
+    key = "%s|%s|%d" % (FLOOR_VERSION, stamp, int(horizon))
+    if cache is not None and cache.is_file() and cache.with_suffix(".json").is_file():
+        try:
+            if json.loads(cache.with_suffix(".json").read_text(encoding="utf-8")).get("key") == key:
+                return np.load(cache)
+        except Exception:
+            pass
+    seg = segmenter or Segmenter(rgb)
+    bottom = [(W * f, H * 0.965) for f in (0.12, 0.5, 0.88)]
+    lift = max(0.0, horizon - 0.14 * H)
+    negative = [(W * 0.5, H * 0.04), (W * 0.06, lift), (W * 0.94, lift)]
+    best, best_rank = None, 0.0
+    for mask, quality in seg.points(bottom, negative):
+        rank = floor_rank(mask, quality, horizon)
+        if rank > best_rank:
+            best, best_rank = mask, rank
+    if best is None:
+        return None
+    out = best.copy()
+    for point in bottom:
+        for mask, quality in seg.points([point], negative):
+            above = float(mask[:max(1, int(horizon - 0.03 * H))].sum()) / max(1.0, float(mask.sum()))
+            if quality >= 0.8 and above < 0.08 and mask[int(0.9 * H):].any():
+                out |= mask
+    below = np.zeros_like(out)
+    below[int(max(0, horizon - 0.02 * H)):] = True
+    out = close_columns(grow_floor(rgb, fill_holes(out & below), below), rgb)
+    if cache is not None:
+        np.save(cache, out)
+        cache.with_suffix(".json").write_text(json.dumps({"key": key, "share": float(out.mean())}), encoding="utf-8")
+    return out
 
 
 def fill_holes(mask, max_share=0.06):
@@ -599,13 +725,17 @@ def save_cutout(texture, mask, bbox, path, work_size):
     return str(path)
 
 
-def recognize(rgb, texture, cache_dir, stamp, keywords_path=None, disp=None, fit=None, horizon=None, focal=None):
+def recognize(rgb, texture, cache_dir, stamp, keywords_path=None, disp=None, fit=None, horizon=None, focal=None,
+              extra_queries=None):
     """Detect, outline and cut out everything in a painting (cached).
 
     Returns (objects, areas, info).  ``objects`` carry their cut-out and placement data;
     ``areas`` carry a mask file for terrain-shaping things (water, mountains).
     """
     table = load_queries(keywords_path)
+    # what this kind of place holds (reference_setting): a street has buildings and cars
+    for phrase, category in (extra_queries or {}).items():
+        table.setdefault(phrase, category)
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     key = "%s|%s|%s" % (RECOGNIZER_VERSION, stamp, hashlib.md5(json.dumps(table, sort_keys=True).encode()).hexdigest())

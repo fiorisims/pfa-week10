@@ -196,6 +196,7 @@ def main(argv=None):
     parser.add_argument("--colors", type=int, default=6)
     parser.add_argument("--layers-dir", default=None,
                         help="for PSD/PSB: export and analyse each layer into this folder")
+    parser.add_argument("--setting", default=None, help="kind of place (reference_setting), default: read it")
     parser.add_argument("--keywords", default=None,
                         help="layer-name vocabulary JSON (created with defaults if missing)")
     args = parser.parse_args(argv)
@@ -222,7 +223,8 @@ def main(argv=None):
         try:
             import reference_inventory
             keywords = args.keywords or str(Path(__file__).with_name("rwb_layer_keywords.json"))
-            result["inventory"] = reference_inventory.build(result, str(source), base_dir / "inventory", keywords)
+            result["inventory"] = reference_inventory.build(result, str(source), base_dir / "inventory", keywords,
+                                                              args.setting)
         except Exception as inventory_error:
             import traceback
             result["inventory"] = {"error": str(inventory_error), "trace": traceback.format_exc()[-600:]}

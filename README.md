@@ -6,7 +6,9 @@ Fiori Sims Week 10 Homework for Programming for Animators FA26
 An Unreal Engine 5.8 tool that turns a concept painting or layered Photoshop file into a walkable 3D
 world. It finds the objects in the picture, places each one where it was painted, builds a new 3D model
 from each outline, and paints the models, ground and water with the painting's own colours and
-brushstrokes.
+brushstrokes. It recognises the kind of place (nature, city street, room, desert, snow, coast): city
+streets get one building per facade and readable 3D sign boards, and the painted floor itself is
+pasted onto the ground. Water is only made where the picture really has it.
 
 Full feature notes are in [`ReferenceWorldBuilder/README.md`](ReferenceWorldBuilder/README.md).
 
@@ -71,7 +73,7 @@ No C++ compiler or Visual Studio is needed.
    - Unreal can't be used while the progress window is up. That's normal.
 
 3. **Walk around:** press **Play in editor**. You start where the painter's eye was, looking into the
-   picture. Walk into the water: you wade through it.
+   picture. Walk into the water: you wade through it. The panel says whether water was found and why.
 
 4. **Save a result:** press **Ctrl+S** to save the level. **Clear** removes everything the tool made.
 
@@ -92,6 +94,9 @@ Other settings in the **BUILD** section:
 
 - **Model style** - 0 = generic low poly, 1 = as painted (press **Generate world** after moving it).
 - **Brushstrokes** - how strong your paint marks are on the sides you never painted.
+- **Setting** - Auto (detected from the picture), or force Nature, City, Interior, Desert, Snow or Coast.
+  Press **Analyze reference** again after changing it.
+- **Water where the picture has water** - untick to never make water.
 - **Grow grass on grassy ground**, **World size**, **Terrain height**, **Prop density**, **Seed**.
 
 ## Tips for the best results

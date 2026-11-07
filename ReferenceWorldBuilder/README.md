@@ -60,13 +60,54 @@ world lines up with the picture.
    **Add extra copies of repeated things outside the painted view**. Characters and creatures
    are never duplicated.
 
+### Cities, rooms, deserts, snow and coasts
+
+Before anything else the tool works out **what kind of place** the picture shows (CLIP compares the whole
+picture with descriptions of each kind). The panel shows it after analysing, for example
+`Setting: city (city 98%, interior 1%, desert 0%)`. Each kind of place changes the rest of the build:
+
+| Setting | Also looks for | Ground can be | Terrain | Grass / extra trees | Walls |
+| --- | --- | --- | --- | --- | --- |
+| Nature | (the usual trees, rocks, water...) | grass, meadow, dirt, sand, rock, water | rolling | yes / yes | - |
+| City | buildings, storefronts, signs, billboards, street lamps, poles, cars, bicycles | road, pavement, grass, water | flat | no / no | street |
+| Interior | furniture, lamps, doors, windows, rugs | floorboards, tiles, carpet | flat | no / no | room |
+| Desert | cacti, palms, tents, ruins | sand, dirt, rock, water | dunes (2.2x) | no / no | - |
+| Snow | snowy pines, igloos | snow, ice, rock, water | hilly (1.8x) | no / yes | - |
+| Coast | palms, sailboats, piers, lighthouses | sand, grass, rock, water | gentle | yes / no | - |
+
+**Streets are lined with individual buildings.** When a city picture looks straight down a street (a level
+camera: building corners upright, facades down both sides), each side is cut into separate buildings where the
+roofline jumps, the facade colour changes, or the detector boxed a building. Every building becomes its own
+block (`RWB_Building_L01`, `R02`...) with its own height from its painted roofline, a small setback, a flat roof and
+ends in its own colour, and a front painted from the picture. Cities that aren't a level street view (looking up,
+tilted, a skyline) are "open": each detected building becomes its own **block** model, a squared-off outline with
+flat walls and a stepped roofline (Blender keeps it square instead of smoothing it).
+
+**Signs and billboards are boards you can read.** Every sign the detector finds becomes its own model
+(`RWB_Sign_...`): a thin board with a dark frame whose face is a sharp crop of the sign from your full-resolution
+picture, lit from inside so the lettering stays readable at night. Tall signs stick out from their wall facing down
+the street and are printed on both sides; wide signs at the sides lie flat on their facade; signs in the middle hang
+across the street facing you. Each board covers exactly the spot it was painted, seen from the start.
+
+**Rooms (and streets with no buildings found) are walled in by the picture itself.** Facades are too big to cut out as objects, so the
+painting is projected onto two side walls and an end wall from the start position: from there the walls look
+exactly like the picture, and as you walk down the street the shop fronts, signs and windows stay where they
+were painted. The street is as wide as the painted people and things are spread (at least about 13 m), things
+painted inside it stay inside it, and the walls stop you walking into the buildings.
+
+**Night pictures** (dark overall, dark sky) get a set sun and a dim sky; every glowing, saturated patch
+(neon signs, lit windows) becomes a coloured light on the wall where it was painted.
+
+If the guess is wrong, click **Setting: Auto** in the BUILD section to choose the kind of place yourself,
+then press **Analyze reference** again.
+
 ### How each object is modelled
 
 | Shape | Used for | How |
 | --- | --- | --- |
 | Inflate | trees, bushes, rocks, flowers, anything unknown | outline puffed out by distance to its edge, so trunks are fat and branches thin |
 | Lathe | towers, mushrooms, lanterns, pillars, pines, furniture | each row of the outline becomes a ring |
-| Slab | walls, gates, signs, people, houses, castles | outline extruded with a soft bevel; houses and castles are deep, signs are thin |
+| Slab | walls, gates, signs, people, houses, castles, buildings, vehicles | outline extruded with a soft bevel; houses and castles are deep, signs are thin |
 | Ground | boats, lily pads, bridges | outline projected through the camera onto the ground, then domed |
 
 ### Grass and water that work like grass and water
@@ -76,9 +117,23 @@ the paint below the horizon by colour and asking CLIP what each group looks like
 by its hue; near-black shadow and framing takes on whatever surrounds it. The panel reports the
 result, such as `Ground: grass 84%, meadow 16%`.
 
-- **Ground** is painted with a seamless tile stitched from that surface's own paint, placed using the
+- **The floor you painted is pasted onto the ground.** For a flat picture SlimSAM outlines the floor (prompted
+  along the bottom of the picture, grown by colour, small gaps such as road markings closed), and the
+  picture's own floor pixels are projected through the painting's camera onto the terrain. Seen from the
+  start, the ground is the painting. They fade out where the picture gets too coarse (roughly 25-40 m away),
+  and where objects stand on the floor (their outlines, not their boxes) the surface's tile fills in.
+- **Beyond that**, the ground is painted with a seamless tile stitched from each surface's own paint, placed using the
   painting's camera, so each spot gets the surface painted there. Slopes and shorelines go bare.
+- **What each surface is** is judged by CLIP seeing it in its surroundings (a lit sidewalk next to a kerb reads
+  as a sidewalk), plus a little by its colour. In streets and rooms only the floor counts as ground, so
+  shop fronts and walls below the horizon don't.
 - **Grass** grows on grassy ground (turn off **Grow grass on grassy ground** to skip it).
+- **Water is only made when it is really water.** Every candidate (a pond the detector found, a bluish part of
+  the ground) is checked by CLIP looking at it with its surroundings and at the whole picture: a lake in a
+  forest reads 81% water, blue-lit pavement or a neon-lit road 10-20%, so those stay dry. Grey paint (a
+  sketch) is never water, and streets and rooms need more proof. The panel says what it decided, e.g.
+  `Water: none (a bluish part of the ground looked wet, but reads as dry ground in its surroundings)`.
+  Untick **Water where the picture has water** to never make any.
 - **Water** is never a floor, in any build mode. If the picture has water, you walk into it, down to the
   basin below, and wade at about half speed at depth.
   Swimming isn't built: you walk on the lake bed.
@@ -297,6 +352,10 @@ plants and rocks guessed from the colours.
 - `../reference_draw.py` - the Shape Sketch drawing window.
 - `../reference_catalog.py` - searches Poly Haven, Objaverse and ModelLibrary for a described model.
 - `../reference_surfaces.py` - reads the ground's surfaces and paints the terrain from them.
+- `../reference_setting.py` - what kind of place the picture is (nature, city, interior...), night and neon lights.
+- `../reference_facades.py` - is it a street? where each building along it starts and ends.
+- `../reference_water.py` - checks every water candidate before it becomes water you can wade into.
+- `Content/Python/rwb_street.py` - streets and rooms: building blocks, walls, sign boards, sign lights.
 - `../rwb_progress.py` - lets helper scripts move the panel's progress bar.
 - `../blender_refine.py` - runs inside Blender to finish each mesh.
 - `Content/Python/rwb_layout.py` - the painting's camera: where everything goes (no `unreal`, testable).

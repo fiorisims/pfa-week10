@@ -211,7 +211,7 @@ def _player_start(scene, heights, world_x, world_y):
     starts = [a for a in wb._all_actors() if isinstance(a, unreal.PlayerStart)]
     if starts:
         start = starts[0]
-        start.set_actor_location(location, False)
+        start.set_actor_location(location, False, True)
         start.set_actor_rotation(unreal.Rotator(yaw=-90.0), False)
         return start
     start = unreal.EditorLevelLibrary.spawn_actor_from_class(unreal.PlayerStart, location, unreal.Rotator(yaw=-90.0))

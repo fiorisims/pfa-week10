@@ -484,6 +484,367 @@ def test_catalog():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_settings():
+    import ast
+    import reference_setting as rs
+    import reference_surfaces as rf
+    import rwb_street
+    # the Unreal side keeps its own copy of the rules (it can't import numpy): they must agree
+    source = (HERE / "ReferenceWorldBuilder" / "Content" / "Python" / "rwb_world.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    node = next(n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "SETTING_RULES")
+    copy = ast.literal_eval(node.value)
+    check("Unreal knows every kind of place", set(copy) == set(rs.SETTINGS) == set(rs.ORDER), (set(copy), set(rs.SETTINGS)))
+    check("both sides agree on what each place does",
+          all(copy[k][f] == rs.SETTINGS[k][f] for k in copy for f in ("terrain", "grass", "forest", "box")))
+    check("every place's ground kinds exist", all(n in rf.SURFACES for k in rs.SETTINGS for n in rs.SETTINGS[k]["surfaces"]))
+    known = set(rm.LATHE | rm.SLAB | rm.GROUND | rm.FOLIAGE | rm.ARCHITECTURE) | {"tree", "rock", "cliff", "log", "mushroom",
+                                                                                   "water", "mountain"}
+    missing = {c for k in rs.SETTINGS for c in rs.SETTINGS[k]["queries"].values() if c not in known}
+    check("every new thing to look for has a way to be modelled", not missing, missing)
+    check("a city is flat, has no meadow grass and is walled by its buildings",
+          rs.SETTINGS["city"]["terrain"] == 0 and not rs.SETTINGS["city"]["grass"] and rs.SETTINGS["city"]["box"])
+    check("a city looks for buildings, cars and signs",
+          {"building", "vehicle", "sign"} <= set(rs.SETTINGS["city"]["queries"].values()))
+    check("the terrain follows the setting's hilliness", "hilliness" in source and 'setting["terrain"]' in source)
+    check("no grass on a street", 'and setting["grass"]' in source)
+    check("no extra copies outside a street's walls", 'setting["box"]' in source)
+    # ground kinds per place
+    cityish = rf.colour_prior((70, 70, 75))
+    check("dark grey reads as road among street grounds", max(("road", "pavement"), key=cityish.get) == "road", cityish)
+    pale = rf.colour_prior((175, 172, 168))
+    check("pale grey reads as pavement", max(("road", "pavement"), key=pale.get) == "pavement", pale)
+    snow = rf.colour_prior((235, 238, 245))
+    check("white reads as snow", max(("snow", "ice", "rock"), key=snow.get) == "snow", snow)
+    tmp = Path(tempfile.mkdtemp(prefix="rwb_set_"))
+    try:
+        pygame.display.init()
+        H, W = 160, 240
+        rgb = np.full((H, W, 3), 40, np.uint8)
+        rgb[70:] = (68, 68, 72)
+        rgb[70:, :40] = (170, 168, 165)
+        rng = np.random.default_rng(3)
+        texture = np.clip(np.repeat(np.repeat(rgb, 2, 0), 2, 1).astype(np.int32) + rng.integers(-8, 8, (H * 2, W * 2, 3)), 0, 255).astype(np.uint8)
+        result = rf.read_surfaces(rgb, texture, 60.0, tmp, allowed=rs.SETTINGS["city"]["surfaces"])
+        kinds = {s["name"] for s in result["surfaces"]}
+        check("a street's ground is road and pavement, not meadow", kinds <= {"road", "pavement"} and "road" in kinds, kinds)
+        nature = rf.read_surfaces(rgb, texture, 60.0, tmp)
+        check("without a setting the old outdoor kinds are used", {s["name"] for s in nature["surfaces"]} <= set(rf.NATURE_SURFACES))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    class FakeClip:
+        def __init__(self, favourite, strength):
+            self.favourite, self.strength = favourite, strength
+
+        def image(self, rgb):
+            return np.ones(1, np.float32)
+
+        def texts(self, phrases):
+            owners = [k for k in rs.ORDER for _p in rs.SETTINGS[k]["phrases"]]
+            return np.array([[self.strength if o == self.favourite else 0.0] for o in owners], np.float32)
+    sure = rs.classify(np.zeros((4, 4, 3), np.uint8), FakeClip("city", 0.2))
+    check("a clear city is a city", sure["setting"] == "city" and not sure["unsure"], sure)
+    vague = rs.classify(np.zeros((4, 4, 3), np.uint8), FakeClip("interior", 0.004))
+    check("an unsure guess builds the default", vague["setting"] == "nature" and vague["unsure"] and "unsure" in rs.line(vague), vague)
+    # night and neon
+    dark = np.full((120, 90, 3), 25, np.uint8)
+    dark[20:30, 60:75] = (255, 40, 200)                    # a pink sign, upper right
+    light = rs.light_of(dark, 60)
+    check("a dark picture is night", light["night"], light)
+    check("a bright picture is day", not rs.light_of(np.full((120, 90, 3), 200, np.uint8), 60)["night"])
+    spots = rs.neon_spots(dark)
+    check("the glowing sign is found", len(spots) >= 1 and spots[0]["u"] > 0.6 and spots[0]["v"] < 0.3, spots[:2])
+    check("its light takes its colour", spots and spots[0]["color"][0] > 200 and spots[0]["color"][1] < 90, spots[:1])
+    check("plain dark paint has no lights", rs.neon_spots(np.full((120, 90, 3), 25, np.uint8)) == [])
+    # walls projected from the painter's eye
+    cam = rwb_layout.PaintCamera(384, 512, 252, 60.0, 160.0, 8000.0)
+    half = 650.0
+    verts, uvs, tris = rwb_street.side_wall(cam, -half, 98.0, cols=12, rows=6)
+    check("a side wall stands at its x", all(v[0] == -half for v in verts))
+    check("its picture stays in the picture", all(0.0 <= u <= 1.0 and 0.0 <= v <= 1.0 for u, v in uvs))
+    check("triangles cover both sides of every cell", len(tris) == 12 * 6 * 12 and max(tris) < len(verts))
+    base = rwb_street.wall_uv(cam, -half, cam.player_y - 3000.0, 0.0)
+    ground = cam.to_image(-half, cam.player_y - 3000.0)
+    check("a wall's foot is where the ground meets it in the picture",
+          near(base[0], ground[0], 1e-6) and near(base[1], ground[1], 1e-6), (base, ground))
+    check("the left wall shows the left of the picture", base[0] < 0.5)
+    check("higher on the wall is higher in the picture",
+          rwb_street.wall_uv(cam, -half, cam.player_y - 3000.0, 600.0)[1] < base[1])
+    check("walls rise with distance, up to the sky line",
+          rwb_street.wall_top(cam, cam.player_y - 6000.0, 98.0) > rwb_street.wall_top(cam, cam.player_y - 1500.0, 98.0))
+    ev, euv, et = rwb_street.end_wall(cam, half, 98.0, cols=4, rows=4)
+    check("the far wall shows the middle of the picture", all(0.3 < u < 0.7 for u, _v in euv), euv[:3])
+    spot = {"u": 0.85, "v": 0.3, "color": [255, 0, 200]}
+    where = rwb_street.light_spot(cam, spot, half)
+    check("a sign's light hangs on its wall", where and near(where[0], half - rwb_street.LIGHT_OFF_WALL, 1e-6), where)
+    back = rwb_street.wall_uv(cam, half, where[1], where[2])
+    check("... where the sign was painted", near(back[1], 0.3, 0.01), back)
+    check("a reflection on the street makes no light", rwb_street.light_spot(cam, {"u": 0.6, "v": 0.95, "color": [255, 0, 0]}, half) is None)
+    width = rwb_street.street_half_width([(200.0, False), (-900.0, False), (5000.0, True)])
+    check("the street is as wide as its people and things stand", 900.0 < width < 1300.0, width)
+    check("an empty street gets a usual width", rwb_street.street_half_width([]) == 650.0)
+    check("signs on the facades don't widen it", rwb_street.street_half_width([(3000.0, True)]) == 650.0)
+    sign = {"centre_u": 0.8, "contact_v": 0.35, "top_v": 0.25, "width_frac": 0.1}
+    hung = rwb_street.on_wall(cam, sign, half)
+    check("a facade sign hangs on its wall", near(hung["x"], half, 1.0) and hung["z"] > 200.0, hung)
+    seen = rwb_street.wall_uv(cam, hung["x"], hung["y"], hung["z"])
+    check("... where it was painted", near(seen[0], 0.8, 0.01) and near(seen[1], 0.35, 0.01), seen)
+    record = {"category": "character", "inst": {"contact_u": 0.5, "contact_v": 0.8, "top_v": 0.6, "width_frac": 0.05,
+                                                 "depth_eye": 0.5}, "place": {"x": 0.0, "width": 50.0}}
+    rwb_street.replace_in_street(cam, record, half)
+    check("a street photo's depth map can't pull people up to the camera",
+          near(record["place"]["distance"], cam.row_distance(0.8 * cam.H), 1.0), record["place"])
+    check("a rough sign outline stays flat, not a blob",
+          rm.choose_method({"category": "sign", "quality": 0.3, "roughness": 30.0}, None, 1.0) == "slab")
+    place = rwb_street.keep_in_street({"x": 2000.0, "width": 200.0}, half)
+    check("painted things stay inside the street", place["x"] < half, place)
+
+
+def _street_picture(W=384, H=512, horizon=250):
+    """A drawn one-point street: dark sky, three buildings a side with their own colours and roofs."""
+    rgb = np.zeros((H, W, 3), np.uint8)
+    rgb[:] = (12, 10, 30)                                     # night sky
+    rgb[horizon:] = (60, 60, 66)                              # road
+    cx = W // 2
+    left = [(0, 70, 0, (200, 60, 150)), (70, 130, 60, (90, 160, 200)), (130, 175, 140, (220, 200, 90))]
+    for x0, x1, roof, colour in left:
+        rgb[roof:horizon + (cx - x0) // 3, x0:x1] = colour
+        rgb[roof:horizon, W - x1:W - x0] = tuple(255 - c for c in colour)
+    # windows: upright edges inside each building
+    for x in range(10, 170, 22):
+        rgb[180:240, x:x + 3] = (250, 250, 230)
+    return rgb, horizon
+
+
+def test_buildings_and_signs():
+    import reference_facades as rfa
+    import reference_inventory as ri
+    import rwb_street
+    rgb, horizon = _street_picture()
+    H, W = rgb.shape[:2]
+    layout = rfa.street_layout(rgb, horizon)
+    check("a level street picture is a street", layout["street"], layout)
+    left = layout["sides"].get("left") or []
+    check("its left side is cut into its buildings", 2 <= len(left) <= 4, [(s["u_near"], s["u_far"]) for s in left])
+    cut_cols = [s["u_far"] * W for s in left[:-1]]
+    check("the cuts fall where one building meets the next",
+          all(min(abs(c - b) for b in (70, 130)) < 8 for c in cut_cols), cut_cols)
+    check("the nearest building runs off the top of the frame", left and left[0]["open_top"])
+    check("a further one has its own roof", any(not s["open_top"] for s in left))
+    check("each building has its own colour", len({tuple(s["color"]) for s in left}) == len(left))
+    tilted = np.array(pygame.surfarray.array3d(pygame.transform.rotate(pygame.surfarray.make_surface(rgb.swapaxes(0, 1)), 25))).swapaxes(0, 1)
+    check("a tilted picture isn't read as a street", not rfa.street_layout(tilted, tilted.shape[0] * 0.5)["street"])
+    open_sky = np.full((300, 300, 3), (120, 170, 230), np.uint8)
+    open_sky[200:] = (90, 90, 90)
+    check("no buildings down the sides, no street", not rfa.street_layout(open_sky, 200)["street"])
+    check("the panel can say which", rfa.line(layout).startswith("Layout: street"))
+
+    # blocks along the street
+    cam = rwb_layout.PaintCamera(W, H, horizon, 60.0, 160.0, 8000.0)
+    half = 650.0
+    blocks = rwb_street.building_blocks(cam, half, layout["sides"])
+    lefts = [b for b in blocks if b["side"] == "left"]
+    check("one block per building (those before the end of the street)", 2 <= len(lefts) <= len(left), (len(lefts), len(left)))
+    check("they follow on without gaps", all(near(a["y_far"], b["y_near"], 1e-6) for a, b in zip(lefts, lefts[1:])))
+    check("the first starts behind you and the last reaches the end of the street",
+          lefts[0]["y_near"] > cam.player_y and near(lefts[-1]["y_far"], cam.player_y - cam.far, 1e-6))
+    check("blocks stand outside the street, on its side", all(b["x_front"] <= -half and b["x_back"] < b["x_front"] for b in lefts))
+    roofed = [b for b in lefts if not b["open_top"]]
+    if roofed:
+        seg = next(s for s in left if not s["open_top"])
+        b = roofed[0]
+        implied = [cam.eye + (cam.horizon - v * cam.H) * max(200.0, min(cam.far, rwb_street.street_distance(cam, half, u))) / cam.focal
+                   for u, v in seg["roof"]]
+        check("a building is as tall as its painted roofline", min(implied) - 1 <= b["height"] <= max(implied) + 1,
+              (b["height"], min(implied), max(implied)))
+    mesh = rwb_street.block_mesh(cam, lefts[0])
+    fv, fuv, ft = mesh["front"]
+    check("a block's front is painted from the picture", all(0.0 <= a <= 1.0 and 0.0 <= c <= 1.0 for a, c in fuv) and max(ft) < len(fv))
+    pv, pt = mesh["plain"]
+    check("roof and ends are closed", len(pv) == 12 and len(pt) == 36)
+
+    # buildings in an open city: squared off
+    mask = np.zeros((40, 30), bool)
+    mask[10:40, 2:14] = True
+    mask[18:40, 14:28] = True
+    mask[6:10, 7:8] = True                                    # an aerial
+    square = rm.block_outline(mask)
+    check("a building's outline keeps its two roof heights",
+          square[11:, 4].all() and not square[12, 20] and square[19:, 20].all(), square[:, 4].sum())
+    check("its ground line is flat", square[-1, 2:28].all())
+    check("an aerial doesn't count as roof", not square[7, 7])
+    verts, faces = rm.block(mask)
+    depth = np.ptp(verts[:, 1])
+    check("a block is deep and square-sided", depth > 5.0 and len(set(np.round(verts[:, 1], 6))) == 2, depth)
+    check("buildings are modelled as blocks", rm.choose_method({"category": "building"}, mask, 1.0) == "block")
+    blender = (HERE / "blender_refine.py").read_text(encoding="utf-8")
+    check("Blender keeps blocks square (no remesh or smoothing)", "def finish_block" in blender and 'method == "block"' in blender)
+
+    # signs
+    check("a tall sign sticks out from its wall", rwb_street.sign_kind([0.1, 0.1, 0.15, 0.4], W, H) == "blade")
+    check("a wide sign in the middle hangs across the street", rwb_street.sign_kind([0.35, 0.3, 0.65, 0.36], W, H) == "front")
+    check("a wide sign at the side is flat on its facade", rwb_street.sign_kind([0.02, 0.3, 0.2, 0.35], W, H) == "facade")
+    for box, kind in (([0.1, 0.1, 0.15, 0.4], "blade"), ([0.35, 0.3, 0.65, 0.36], "front"), ([0.02, 0.3, 0.2, 0.35], "facade")):
+        corners, got, _normal = rwb_street.board_corners(cam, box, half)
+        uvs = [rwb_street.image_uv(cam, *p) for p in corners]
+        check("a %s sign covers exactly where it was painted" % kind,
+              all(near(uv[0], want[0], 0.01) and near(uv[1], want[1], 0.01)
+                  for uv, want in zip(uvs, [(box[0], box[3]), (box[2], box[3]), (box[2], box[1]), (box[0], box[1])])),
+              (kind, [tuple(round(c, 3) for c in uv) for uv in uvs]))
+        check("... and stays inside the street", all(abs(p[0]) <= half for p in corners), corners)
+    board = {"box_frac": [0.1, 0.1, 0.15, 0.4]}
+    mesh, kind = rwb_street.board_mesh(cam, board, half)
+    fv, fuv, ft = mesh["face"]
+    n = len(fv) // 2
+    check("a blade is printed on both sides", kind == "blade" and len(fv) == 2 * n)
+    check("its back reads the right way round from behind", all(near(fuv[i][0], 1.0 - fuv[i + n][0], 1e-9) for i in range(n)))
+    check("its picture is its own crop, edge to edge", min(u for u, _ in fuv) < 0.02 and max(u for u, _ in fuv) > 0.98)
+    _mesh, kind = rwb_street.board_mesh(cam, {"box_frac": [0.4, 0.3, 0.6, 0.36]}, None,
+                                        {"x": 300.0, "y": cam.player_y - 2000.0, "z": 400.0, "width": 300.0, "height": 80.0})
+    check("in an open city a sign faces the start", kind == "front")
+    tmp = Path(tempfile.mkdtemp(prefix="rwb_sign_"))
+    try:
+        pygame.display.init()
+        big = pygame.Surface((800, 600))
+        big.fill((10, 10, 10))
+        big.fill((255, 0, 128), pygame.Rect(400, 150, 200, 60))
+        info = ri.sign_board(big, [0.5, 0.25, 0.75, 0.35], tmp / "s.png")
+        crop = pygame.image.load(str(tmp / "s.png"))
+        check("a sign's crop is taken from the full picture", crop.get_width() >= 200 and crop.get_at((crop.get_width() // 2, crop.get_height() // 2))[:3] == (255, 0, 128),
+              (crop.get_size(), crop.get_at((crop.get_width() // 2, crop.get_height() // 2))))
+        check("with a little margin, so no letter is clipped", info["box_frac"][0] < 0.5 and info["box_frac"][2] > 0.75)
+        objects = {"sign": {"category": "sign", "instances": [{"bbox_px": [200, 75, 300, 105]}]},
+                   "tree": {"category": "tree", "instances": [{"bbox_px": [0, 0, 10, 10]}]}}
+        pygame.image.save(big, str(tmp / "pic.png"))
+        full = ri.add_boards(objects, tmp / "pic.png", tmp, 400, 300)
+        check("every sign gets a board, nothing else does",
+              "board" in objects["sign"]["instances"][0] and "board" not in objects["tree"]["instances"][0] and Path(full).is_file())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    world = (HERE / "ReferenceWorldBuilder" / "Content" / "Python" / "rwb_world.py").read_text(encoding="utf-8")
+    check("signs are built as boards, not outline meshes", "SIGN_BOARDS" in world and "build_boards" in world)
+    check("a street with buildings has no flat side walls", "walls=not blocks" in world)
+
+
+def test_water_check():
+    import reference_water as rw
+    import reference_surfaces as rf
+    # the rules, from the measured evidence (a lake 0.81-0.90 in context; blue-lit pavement 0.10-0.18)
+    check("a lake in its surroundings is water", rw.decide(0.85, 0.44, 0.4, 0.09)[0])
+    check("blue-lit pavement isn't water", not rw.decide(0.10, 0.19, 0.5, 0.03)[0])
+    check("a blue road isn't water", not rw.decide(0.18, 0.13, 0.4, 0.18)[0])
+    check("a likely pond counts if the picture has water", rw.decide(0.4, 0.45, 0.3, 0.05)[0])
+    check("... but not if the picture says it hasn't", not rw.decide(0.4, 0.15, 0.3, 0.05)[0])
+    check("a street needs more proof than a forest", rw.decide(0.55, 0.2, 0.3, 0.05)[0] and not rw.decide(0.55, 0.2, 0.3, 0.05, built_up=True)[0])
+    check("grey paint is never water (sketches)", not rw.decide(0.95, 0.9, 0.05, 0.1)[0])
+    check("a speck is never a pond", not rw.decide(0.95, 0.9, 0.5, 0.001)[0])
+
+    class FakeClip:
+        """Says 'water' for blue crops that have no grey around them, like CLIP seeing a kerb."""
+        def __init__(self):
+            self.seen = []
+
+        def texts(self, phrases):
+            self.phrases = phrases
+            out = np.zeros((len(phrases), 3), np.float32)
+            out[0, 0] = 1.0                         # the first phrase is water
+            out[-1, 2] = 1.0                        # the last is a dry look-alike
+            return out
+
+        def image(self, rgb):
+            self.seen.append(rgb.shape)
+            grey = float((np.abs(rgb.astype(np.int32) - 128).sum(-1) < 20).mean())
+            wet = 1.0 - grey
+            return np.array([wet * 0.2, 0.0, grey * 0.4], np.float32)
+
+    pond = np.full((100, 100, 3), (40, 90, 200), np.uint8)
+    mask = np.zeros((100, 100), bool)
+    mask[60:90, 20:80] = True
+    fake = FakeClip()
+    verdict = rw.confirm(pond, mask, ["grass"], "nature", None, fake)
+    check("an all-water picture's pond is kept", verdict["keep"], verdict)
+    check("the check looks at the pond with what's around it", fake.seen and fake.seen[0][0] > 30, fake.seen[:1])
+    street = np.full((100, 100, 3), 128, np.uint8)
+    street[60:90, 20:80] = (40, 90, 200)
+    verdict = rw.confirm(street, mask, ["road", "pavement"], "city", None, FakeClip())
+    check("a blue patch in a grey street is rejected", not verdict["keep"], verdict)
+    check("the panel says why", "none" in rw.line([dict(verdict, source="bluish ground")]) and "yes" in rw.line([dict(verdict, keep=True, region=0.9)]))
+    check("no candidates, no water", rw.line([]) == "Water: none")
+    inventory = (HERE / "reference_inventory.py").read_text(encoding="utf-8")
+    check("every water source is checked",
+          inventory.count("real_water(") >= 4 and '"detected pond"' in inventory and '"bluish part of the ground"' in inventory)
+    world = (HERE / "ReferenceWorldBuilder" / "Content" / "Python" / "rwb_world.py").read_text(encoding="utf-8")
+    check("the panel's water box can turn water off", 'values.get("water", True)' in world)
+
+    # the painted floor, pasted onto the ground
+    cam_obj = rwb_layout.PaintCamera(300, 200, 80.0, 60.0, 160.0, 8000.0)
+    cam = {"W": 300.0, "H": 200.0, "horizon": 80.0, "focal": cam_obj.focal, "eye": 160.0, "player_y": cam_obj.player_y}
+    check("near ground is pasted as painted", rf.floor_weight(np.array(300.0), cam, 200) == 1.0)
+    check("far ground is too coarse to paste", rf.floor_weight(np.array(6000.0), cam, 200) == 0.0)
+    picture = np.zeros((200, 300, 3), np.uint8)
+    picture[:, :150] = (250, 0, 0)
+    picture[:, 150:] = (0, 0, 250)
+    floor_mask = np.ones((200, 300), bool)
+    floor_mask[:, 200:] = False                                  # an object hides the right side
+    xs, ys = np.meshgrid(np.linspace(-400, 400, 9), cam_obj.player_y - np.array([400.0, 600.0]))
+    base = np.full(xs.shape + (3,), 100.0, np.float32)
+    out = rf.paste_floor(base, xs, ys, cam, picture, floor_mask)
+    left = out[0, 2]                                             # left of centre, near
+    check("the floor's own paint lands where the picture shows it", left[0] > 150 and left[0] > left[2] + 100, left)
+    hidden = cam_obj.to_image(float(xs[0, 8]), float(ys[0, 8]))
+    check("where an object hides the floor, the tile stays",
+          (hidden is None or hidden[0] * 300 >= 200) and np.allclose(out[0, 8], 100.0, atol=1.0), (hidden, out[0, 8]))
+    behind = rf.paste_floor(base, xs, xs * 0 + cam_obj.player_y + 300.0, cam, picture, floor_mask)
+    check("behind the painter's eye, the tile stays", np.allclose(behind, 100.0))
+    surfaces_src = (HERE / "reference_surfaces.py").read_text(encoding="utf-8")
+    check("ground kinds are judged in their surroundings", "context_opinions(rgb, masks, names)" in surfaces_src)
+    check("the floor is handed to the ground bake", '"floor": surfaces.get("floor")' in world)
+
+
+def test_floor_finding():
+    import reference_inventory as ri
+    H, W = 100, 80
+    floor = np.zeros((H, W), bool)
+    floor[60:, :] = True
+    wall = np.zeros((H, W), bool)
+    wall[10:70, :] = True
+    check("the floor ranks above a wall", ro.floor_rank(floor, 0.9, 50) > ro.floor_rank(wall, 0.95, 50))
+    rgb = np.full((H, W, 3), 90, np.uint8)
+    rgb[:55] = (200, 60, 160)                                  # a shop front
+    broken = floor.copy()
+    broken[70:78, 20:60] = False                               # a lit patch SAM left out
+    closed = ro.close_columns(broken, rgb)
+    check("a gap in the floor with floor around it is floor", closed[70:78, 20:60].all())
+    sliver = np.zeros((H, W), bool)
+    sliver[50:58, :] = True
+    sliver[80:, :] = True
+    rgb2 = rgb.copy()
+    rgb2[58:80] = (250, 250, 250)                               # a bright shop window between them
+    check("a shop front between floor and a sliver stays out", not ro.close_columns(sliver, rgb2)[60:78].any())
+    grown = ro.grow_floor(rgb, floor & (np.arange(H)[:, None] > 72), np.arange(H)[:, None].repeat(W, 1) >= 55)
+    check("SAM's near floor grows to the rest of the same ground", grown[62:, :].mean() > 0.9 and not grown[:55].any(),
+          grown[62:].mean())
+    # objects hide the floor by their outlines, and a leaked outline hides nothing
+    tmp = Path(tempfile.mkdtemp(prefix="rwb_floor_"))
+    try:
+        pygame.display.init()
+        cut = pygame.Surface((10, 20), pygame.SRCALPHA, 32)
+        cut.fill((0, 0, 0, 0))
+        pygame.draw.rect(cut, (255, 0, 0, 255), pygame.Rect(3, 0, 4, 20))   # a thin pole
+        pygame.image.save(cut, str(tmp / "pole.png"))
+        objects = {"pole": {"instances": [{"bbox_px": [10, 40, 20, 60], "cutout": str(tmp / "pole.png")}]}}
+        hidden = ri._objects_mask(objects, H, W)
+        check("an object hides its outline, not its whole box", hidden[50, 15] and not hidden[50, 10] and hidden[40:60, 10:20].mean() < 0.8)
+        objects["gate"] = {"instances": [{"bbox_px": [30, 50, 70, 100]}]}                     # its box is all floor
+        hidden = ri._objects_mask(objects, H, W, floor)
+        check("an outline that is mostly floor has leaked: it hides nothing", not hidden[80, 50])
+        check("boxes can still be asked for", ri._objects_mask(objects, H, W, None, boxes_only=True)[45, 11])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    inventory = (HERE / "reference_inventory.py").read_text(encoding="utf-8")
+    check("flat pictures get a floor outline", "reference_objects.floor_mask(" in inventory)
+
+
 def test_trees_and_style():
     tall = {"bbox_frac": [0.0, 0.0, 0.26, 0.86]}
     short = {"bbox_frac": [0.1, 0.8, 0.2, 0.9]}
@@ -517,12 +878,12 @@ def test_trees_and_style():
 
 def test_surfaces():
     import reference_surfaces as rf
-    check("green reads as grass", max(rf.colour_prior((70, 150, 60)), key=rf.colour_prior((70, 150, 60)).get) == "grass")
-    check("clear blue reads as water", max(rf.colour_prior((60, 140, 220)), key=rf.colour_prior((60, 140, 220)).get) == "water")
-    check("brown reads as dirt", max(rf.colour_prior((130, 90, 50)), key=rf.colour_prior((130, 90, 50)).get) == "dirt")
-    check("grey reads as rock", max(rf.colour_prior((120, 120, 120)), key=rf.colour_prior((120, 120, 120)).get) == "rock")
+    check("green reads as grass", max(rf.NATURE_SURFACES, key=rf.colour_prior((70, 150, 60)).get) == "grass")
+    check("clear blue reads as water", max(rf.NATURE_SURFACES, key=rf.colour_prior((60, 140, 220)).get) == "water")
+    check("brown reads as dirt", max(rf.NATURE_SURFACES, key=rf.colour_prior((130, 90, 50)).get) == "dirt")
+    check("grey reads as rock", max(rf.NATURE_SURFACES, key=rf.colour_prior((120, 120, 120)).get) == "rock")
     check("a dark bluish shadow isn't water", rf.colour_prior((30, 40, 60))["water"] < 0.2, rf.colour_prior((30, 40, 60)))
-    check("muted teal-green paint is grass, not stone", max(rf.colour_prior((62, 70, 68)), key=rf.colour_prior((62, 70, 68)).get) == "grass",
+    check("muted teal-green paint is grass, not stone", max(rf.NATURE_SURFACES, key=rf.colour_prior((62, 70, 68)).get) == "grass",
           rf.colour_prior((62, 70, 68)))
     names = list(rf.SURFACES)
     say_dirt = np.zeros(len(names)); say_dirt[names.index("dirt")] = 1.0
@@ -986,7 +1347,7 @@ def main():
     args = parser.parse_args()
     for test in (test_camera, test_placement, test_ground_placement, test_filtering, test_masks, test_labels,
                  test_psd_names, test_mesh, test_ground_shape, test_end_to_end_no_blender,
-                 test_clicks_are_queued, test_catalog, test_trees_and_style, test_surfaces, test_wading, test_progress_and_speed, test_shape_choice, test_outlines, test_water,
+                 test_clicks_are_queued, test_catalog, test_settings, test_buildings_and_signs, test_water_check, test_floor_finding, test_trees_and_style, test_surfaces, test_wading, test_progress_and_speed, test_shape_choice, test_outlines, test_water,
                  test_read_strokes, test_quilt, test_bake, test_sketch):
         test()
     if args.live:

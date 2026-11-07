@@ -76,7 +76,7 @@ class PaintCamera:
         return abs(x) <= half + margin
 
     # ---- objects -------------------------------------------------------------
-    def place(self, inst, category="", airborne=("floating", "creature", "lantern", "prop_card", "drawn")):
+    def place(self, inst, category="", airborne=("floating", "creature", "lantern", "prop_card", "drawn", "sign")):
         """Everything a builder needs for an object seen in the picture.
 
         inst keys (fractions of the picture): contact_u, contact_v, top_v, width_frac,

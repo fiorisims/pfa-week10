@@ -245,6 +245,28 @@ def adopt(entry):
     return {"mesh": path, "surface": surface, "tris": triangle_count(obj), "size": size}
 
 
+def finish_block(obj, entry):
+    """A building keeps its exact squared-off shape: flat walls merged into single faces, no smoothing."""
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.remove_doubles(threshold=1e-4)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    apply_modifier(obj, "DECIMATE", decimate_type="DISSOLVE", angle_limit=math.radians(1.0))
+    bpy.ops.object.shade_flat()
+    area = max(1e-6, sum(p.area for p in obj.data.polygons))
+    unwrap(obj)
+    stem = os.path.splitext(entry["mesh"])[0]
+    surface = stem + "_surface.npz"
+    save_surface(obj, surface)
+    path = stem + ".fbx"
+    bpy.ops.export_scene.fbx(
+        filepath=path, use_selection=True, apply_unit_scale=True, apply_scale_options="FBX_SCALE_NONE",
+        axis_forward="-Y", axis_up="Z", bake_space_transform=False, object_types={"MESH"},
+        use_mesh_modifiers=False, mesh_smooth_type="FACE", add_leaf_bones=False, bake_anim=False,
+        path_mode="COPY", embed_textures=False)
+    return {"mesh": path, "surface": surface, "tris": triangle_count(obj), "area": area}
+
+
 def refine(entry):
     if entry.get("method") == "adopt":
         return adopt(entry)
@@ -253,6 +275,8 @@ def refine(entry):
     obj = make_object(entry["name"], verts, faces)
     method = entry["method"]
     detail = float(entry.get("detail", 1.0))
+    if method == "block":
+        return finish_block(obj, entry)
     remesh_detail(obj, method, detail, np.array(obj.dimensions))
     if detail < HULL_BELOW:
         to_convex_hull(obj)

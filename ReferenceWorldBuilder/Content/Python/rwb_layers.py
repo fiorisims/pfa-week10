@@ -65,6 +65,7 @@ SIZE_PRIORS = {
     "castle": (3200.0, 0.35), "tower": (1600.0, 0.35), "house": (750.0, 0.4), "wall": (350.0, 0.35),
     "fence": (120.0, 0.5), "bridge": (300.0, 0.3), "gate": (450.0, 0.4), "pillar": (450.0, 0.35),
     "lantern": (260.0, 0.6), "furniture": (110.0, 0.6),
+    "building": (1500.0, 0.3), "sign": (150.0, 0.4), "vehicle": (150.0, 0.6),
 }
 
 # Distance tags from layer names.  0 = far edge of the terrain, 1 = the player's

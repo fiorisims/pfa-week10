@@ -372,7 +372,8 @@ def analyze_reference(path):
     layers_dir = PROJECT_DIR / "Saved" / "RWBLayers" / stem
     stdout = _run_helper(
         ANALYZE_SCRIPT,
-        [str(path), "--grid", "24", "--colors", "6", "--layers-dir", str(layers_dir), "--keywords", str(KEYWORDS_FILE)],
+        [str(path), "--grid", "24", "--colors", "6", "--layers-dir", str(layers_dir), "--keywords", str(KEYWORDS_FILE)]
+        + ([] if _setting["choice"] == "auto" else ["--setting", _setting["choice"]]),
         timeout=1200,
         message="Reading your picture: objects, outlines, brushstrokes (about a minute)",
     )
@@ -1009,7 +1010,7 @@ def _place_player(world_x, world_y, heights, water_z, occupied=None):
     starts = [actor for actor in _all_actors() if isinstance(actor, unreal.PlayerStart)]
     if starts:
         start = starts[0]
-        start.set_actor_location(location, False)
+        start.set_actor_location(location, False, True)
         start.set_actor_rotation(unreal.Rotator(yaw=-90.0), False)
         return start
     start = unreal.EditorLevelLibrary.spawn_actor_from_class(unreal.PlayerStart, location, unreal.Rotator(yaw=-90.0))
@@ -1561,7 +1562,7 @@ def _pie_tick(_delta):
 
         light = _pie["light"]
         if light:
-            light.set_actor_location(unreal.Vector(here.x, here.y, here.z + 90.0), False)
+            light.set_actor_location(unreal.Vector(here.x, here.y, here.z + 90.0), False, True)
             component = light.get_component_by_class(unreal.PointLightComponent)
             if component:
                 fade = max(0.0, 1.0 - nearest / radius) if nearest < radius else 0.0
@@ -1694,11 +1695,16 @@ def _build_runtime_ui(widget, force=False):
         widget, content, "Build", "BUILD",
         "Brightness becomes terrain height. Colour regions decide what grows where.",
     )
+    setting_row = _new(unreal.HorizontalBox, widget, "SettingRow")
+    _add(setting_row, _button(widget, "SettingButton", _setting_label(), "sky"), _margin(8, 4, 8, 4))
+    _add(setting_row, _text(widget, "SettingHint", "Click to change the kind of place, then Analyze again.", size=10),
+         _margin(0, 8, 8, 4), fill=True)
+    _add(build, setting_row)
     _slider_row(widget, build, "WorldSize", "World size", 4000.0, 2000.0, 6000.0)
     _slider_row(widget, build, "Height", "Terrain height", 560.0, 120.0, 1200.0)
     _slider_row(widget, build, "Density", "Prop density", 0.55, 0.05, 1.0, True)
     _field_row(widget, build, "Seed", "Seed", "20261104")
-    _check_row(widget, build, "Water", "Add water at the dark lowlands", True)
+    _check_row(widget, build, "Water", "Water where the picture has water (checked before it's made)", True)
     _check_row(widget, build, "HideTemplate", "Hide the template floor and props", True)
     _check_row(widget, build, "AutoGenerate", "Generate the world right after analyzing", True)
     _check_row(widget, build, "GenerateModels", "Create new 3D models from the painting (refined in Blender if installed)", True)
@@ -1828,7 +1834,8 @@ def bind_widget(widget):
         _retired_callbacks.extend(_callbacks.values())
         _callbacks = {}
     rebound = []
-    for name in ("BrowseButton", "AnalyzeButton", "GenerateButton", "ClearButton", "PlayButton", "StopButton", "DrawButton"):
+    for name in ("BrowseButton", "AnalyzeButton", "GenerateButton", "ClearButton", "PlayButton", "StopButton", "DrawButton",
+                 "SettingButton"):
         button = _maybe(widget, name)
         if not button:
             continue
@@ -1894,7 +1901,29 @@ def _read_values(widget):
         "grow_grass": _checked(widget, "GrowGrassBox", True),
         "auto_generate": _checked(widget, "AutoGenerateBox", True),
         "fov": _slider_value(widget, "FovSlider", 60.0),
+        "setting": _setting["choice"],
     }
+
+
+# the kind of place: "auto" reads it from the picture (reference_setting)
+SETTING_CHOICES = ["auto", "nature", "city", "interior", "desert", "snow", "coast"]
+_setting = {"choice": "auto"}
+
+
+def _setting_label():
+    choice = _setting["choice"]
+    return "Setting: Auto (from the picture)" if choice == "auto" else "Setting: " + choice.capitalize()
+
+
+def cycle_setting(widget):
+    """Next kind of place.  It decides what the next analysis looks for and how the world is built."""
+    index = SETTING_CHOICES.index(_setting["choice"]) if _setting["choice"] in SETTING_CHOICES else 0
+    _setting["choice"] = SETTING_CHOICES[(index + 1) % len(SETTING_CHOICES)]
+    label = _maybe(widget, "SettingButtonLabel")
+    if label:
+        label.set_text(_setting_label())
+    _status(widget, "%s. Press Analyze reference to read the picture again as this kind of place."
+            % _setting_label())
 
 
 def _checked(widget, name, default):
@@ -1978,6 +2007,11 @@ def analyze_clicked(widget):
                 info.set_text("Flat image -> perspective only (no depth: %s). Horizon at %d%%."
                               % (scene.get("depth_error"), round(100.0 * scene.get("horizon", 0) / max(1, scene.get("height", 1)))))
     inventory = data.get("inventory") or {}
+    place = inventory.get("setting") or {}
+    if place.get("line"):
+        night = "  |  night: lit signs become lights" if place.get("night") else ""
+        _find(widget, "ReferenceInfo").set_text(str(_find(widget, "ReferenceInfo").get_text()) + "\n" + place["line"] + night)
+        unreal.log("Reference World Builder: " + place["line"] + night)
     values = _read_values(widget)
     if info and inventory and not values.get("exact_layout"):
         if inventory.get("error"):
@@ -2080,6 +2114,7 @@ _BUTTON_ACTIONS.update({
     "PlayButton": play,
     "StopButton": stop,
     "DrawButton": open_sketch,
+    "SettingButton": cycle_setting,
 })
 
 

@@ -35,7 +35,7 @@ import reference_layers as rl  # noqa: E402
 import reference_objects  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
-INVENTORY_VERSION = "rwb-inventory-2"
+INVENTORY_VERSION = "rwb-inventory-5"
 WATER_GRID = 72           # terrain follows the shore much better than the old 24 x 24 grid
 MAX_LAYER_LOOKS = 24      # PSD layers recognised from pixels per analysis (about 3 s each)
 GENERIC_MIN_SCORE = 0.15  # a "Layer 3" must look like something, or it is paint rather than an object
@@ -264,16 +264,54 @@ def _merge_grids(grids):
     return [[max(g[y][x] for g in grids if len(g) == size) for x in range(size)] for y in range(size)]
 
 
-def _objects_mask(objects, H, W):
-    """Everything standing on the ground, from the objects' boxes: that isn't surface."""
+FLOOR_LEAK = 0.35         # an outline that is this much floor has leaked onto it (a gate over a street)
+
+
+def _objects_mask(objects, H, W, floor=None, boxes_only=False):
+    """Everything standing on the ground, from the objects' own outlines (their boxes as a fallback).
+
+    Boxes are far too big for this: a storefront's box covers the sidewalk in front of it.  With the
+    floor's outline, an object whose outline is mostly floor has leaked onto it and hides nothing.
+    """
     hidden = np.zeros((H, W), bool)
     for entry in objects.values():
         for inst in entry["instances"]:
             box = inst.get("bbox_px") or inst.get("box")
-            if box:
-                x0, y0, x1, y1 = [int(v) for v in box]
-                hidden[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = True
+            if not box:
+                continue
+            x0, y0, x1, y1 = [int(round(v)) for v in box]
+            x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            outline = None if boxes_only else _cutout_alpha(inst.get("cutout"), x1 - x0, y1 - y0)
+            if outline is None:
+                outline = np.ones((y1 - y0, x1 - x0), bool)
+            if floor is not None and outline.any() and                     float((outline & floor[y0:y1, x0:x1]).sum()) / float(outline.sum()) > FLOOR_LEAK:
+                continue
+            hidden[y0:y1, x0:x1] |= outline
     return hidden
+
+
+def _cutout_alpha(path, w, h):
+    """A cut-out's outline at (w, h), or None."""
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        import pygame
+        surf = pygame.image.load(str(path))
+        if not surf.get_flags() & pygame.SRCALPHA and surf.get_bitsize() < 32:
+            return None
+        alpha = pygame.surfarray.array_alpha(surf).T.astype(np.float32) / 255.0
+        outline = _resize(alpha, w, h) > 0.4
+        # a pixel's margin, so the ground's edge doesn't take in the object's rim
+        grown = outline.copy()
+        grown[1:] |= outline[:-1]
+        grown[:-1] |= outline[1:]
+        grown[:, 1:] |= outline[:, :-1]
+        grown[:, :-1] |= outline[:, 1:]
+        return grown
+    except Exception:
+        return None
 
 
 def _load_depth(scene, shape):
@@ -375,7 +413,69 @@ def recognise_unnamed_layers(layers, keywords_path):
     return layers, looked
 
 
-def build(result, image_path, cache_dir, keywords_path):
+# --------------------------------------------------------------------------- #
+# signs and pictures at full resolution
+# --------------------------------------------------------------------------- #
+SIGN_CATEGORIES = {"sign"}
+SIGN_MARGIN = 0.04         # of the sign's own size, so its edge letters aren't clipped
+PICTURE_LONG = 2048        # the full picture, for walls and facades
+
+
+def _full_picture(image_path, cache_dir):
+    """The source picture as a pygame surface (largest side PICTURE_LONG) and a PNG copy, or (None, None)."""
+    import pygame
+    try:
+        surf = pygame.image.load(str(image_path))
+    except Exception:
+        return None, None
+    w, h = surf.get_size()
+    scale = min(1.0, PICTURE_LONG / float(max(w, h)))
+    if scale < 1.0:
+        if surf.get_bitsize() < 24:
+            surf = surf.convert(24) if hasattr(surf, "convert") and pygame.display.get_surface() else surf
+        surf = pygame.transform.smoothscale(surf, (max(1, int(w * scale)), max(1, int(h * scale))))
+    path = Path(cache_dir).resolve() / "picture_full.png"
+    pygame.image.save(surf, str(path))
+    return surf, str(path)
+
+
+def sign_board(surf, box_frac, path, margin=SIGN_MARGIN):
+    """Save a sign's crop of the full picture (opaque, so its lettering is all there).  Returns size info."""
+    import pygame
+    W, H = surf.get_size()
+    u0, v0, u1, v1 = box_frac
+    mx, my = (u1 - u0) * margin, (v1 - v0) * margin
+    x0, y0 = max(0, int((u0 - mx) * W)), max(0, int((v0 - my) * H))
+    x1, y1 = min(W, int(math.ceil((u1 + mx) * W))), min(H, int(math.ceil((v1 + my) * H)))
+    x1, y1 = max(x0 + 2, x1), max(y0 + 2, y1)
+    crop = pygame.Surface((x1 - x0, y1 - y0), pygame.SRCALPHA, 32)
+    crop.blit(surf, (0, 0), pygame.Rect(x0, y0, x1 - x0, y1 - y0))
+    pygame.image.save(crop, str(path))
+    return {"texture": str(path), "box_frac": [x0 / float(W), y0 / float(H), x1 / float(W), y1 / float(H)],
+            "pixels": [x1 - x0, y1 - y0]}
+
+
+def add_boards(objects, image_path, cache_dir, W, H):
+    """Every sign instance gets a sharp crop of itself (inst["board"]).  Returns the full picture's path."""
+    surf, full = _full_picture(image_path, cache_dir)
+    if surf is None:
+        return None
+    number = 0
+    for entry in objects.values():
+        if entry["category"] not in SIGN_CATEGORIES:
+            continue
+        for inst in entry["instances"]:
+            box = inst.get("bbox_px") or inst.get("box")
+            if not box:
+                continue
+            frac = [box[0] / float(W), box[1] / float(H), box[2] / float(W), box[3] / float(H)]
+            inst["board"] = sign_board(surf, frac, Path(cache_dir).resolve() / ("sign_%02d.png" % number))
+            number += 1
+    return full
+
+
+def build(result, image_path, cache_dir, keywords_path, setting=None):
+    """The inventory of a picture.  setting: a reference_setting name, or None/"auto" to read it."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     scene = result.get("scene") or {}
@@ -388,8 +488,41 @@ def build(result, image_path, cache_dir, keywords_path):
     H, W = rgb.shape[:2]
     horizon = float(scene.get("horizon", 0.35 * H)) * (H / float(scene.get("height", H) or H))
     disp = _load_depth(scene, (H, W))
+    # what kind of place: decides what to look for, what the ground can be, and how the world is built
+    import reference_setting
+    rwb_progress.report(0.25, "Working out what kind of place this is")
+    try:
+        place = reference_setting.classify(rgb)
+    except Exception as error:
+        place = {"setting": "nature", "scores": {}, "error": str(error)[:160]}
+    chosen = setting if setting in reference_setting.SETTINGS else place["setting"]
+    rules = reference_setting.get(chosen)
+    lighting = reference_setting.light_of(rgb, horizon)
+    if chosen in reference_setting.INDOOR:
+        lighting["night"] = False
+    setting_info = {"name": chosen, "detected": place["setting"], "scores": place.get("scores", {}),
+                    "line": reference_setting.line(place, chosen) if place.get("scores") else "Setting: " + chosen,
+                    **{k: rules[k] for k in ("terrain", "grass", "forest", "box")}, **lighting,
+                    "lights": reference_setting.neon_spots(rgb) if lighting["night"] else []}
     objects = {}
     water_grids, hill_grids, missing = [], [], []
+    water_checks = []                                  # every water candidate and what the check said
+    water_scene = {}
+
+    def real_water(mask, source):
+        """Keep a water candidate only if it really is water (reference_water)."""
+        if mask is None or not mask.any():
+            return None
+        import reference_water
+        if "scene" not in water_scene:
+            try:
+                water_scene["scene"] = reference_water.scene_probability(rgb)
+            except Exception:
+                water_scene["scene"] = None
+        verdict = reference_water.confirm(rgb, mask, rules["surfaces"], chosen, water_scene["scene"])
+        verdict["source"] = source
+        water_checks.append(verdict)
+        return mask if verdict["keep"] else None
     atmosphere = {}
     source, info = "", ""
 
@@ -458,7 +591,7 @@ def build(result, image_path, cache_dir, keywords_path):
             focal = (W / 2.0) / math.tan(math.radians(60.0) / 2.0)
             recognised = reference_objects.recognize(
                 rgb, texture, cache_dir, scene.get("stamp", str(image_path)), keywords_path,
-                disp, scene.get("fit"), horizon, focal)
+                disp, scene.get("fit"), horizon, focal, rules["queries"])
         except Exception as error:
             info = str(error).splitlines()[0][:160] if str(error) else type(error).__name__
         water_mask = None
@@ -467,7 +600,7 @@ def build(result, image_path, cache_dir, keywords_path):
             source = "detector"
             if layers is not None:
                 info = "%s (nothing usable in the layers)" % info
-            water_mask = refine_water(rgb, areas, horizon)
+            water_mask = real_water(refine_water(rgb, areas, horizon), "detected pond")
             for area in areas:
                 if area["category"] == "mountain" and area["score"] >= MOUNTAIN_MIN_SCORE:
                     mask = np.load(area["mask"])
@@ -522,12 +655,31 @@ def build(result, image_path, cache_dir, keywords_path):
                  "t": _depth_t(box[3], H, horizon), "box": [round(v, 1) for v in box],
                  "aspect": (box[3] - box[1]) / max(1.0, box[2] - box[0]),
                  "colors": _profile(rgb, box), "score": round(d.get("score", 0.0), 3), "label": category})
+        if water_mask is not None and not water_grids:
+            water_mask = real_water(water_mask, "bluish patch")
         if water_mask is not None and water_mask.mean() > 0.01:
             if not water_grids:
                 water_grids.append(_grid_from_mask(water_mask))
                 atmosphere.setdefault("water", rl._hex(rgb[water_mask].mean(0)))
         boxes = [o["box"] for e in objects.values() for o in e["instances"]]
 
+    # signs: a sharp crop each, so they can be boards you can read
+    full_picture = None
+    try:
+        full_picture = add_boards(objects, image_path, cache_dir, W, H)
+    except Exception as error:
+        missing.append("sign crops (%s)" % str(error)[:80])
+    # a street: where each building along it starts and ends
+    if chosen == "city":
+        try:
+            import reference_facades
+            buildings = [i["box"] for e in objects.values() if e["category"] == "building" for i in e["instances"]]
+            layout = reference_facades.street_layout(rgb, horizon, buildings)
+            layout["line"] = reference_facades.line(layout)
+        except Exception as error:
+            layout = {"street": False, "reason": str(error)[:120], "sides": {}, "line": "Layout: open city"}
+        setting_info["layout"] = layout
+        setting_info["box"] = bool(layout["street"])      # an open city has no street to wall in
     out_objects = []
     for entry in objects.values():
         n = len(entry["instances"])
@@ -544,12 +696,25 @@ def build(result, image_path, cache_dir, keywords_path):
     rwb_progress.report(0.86, "Reading the ground: grass, dirt, water")
     try:
         import reference_surfaces
-        hidden = _objects_mask(objects, H, W)
+        floor = None
+        if layers is None:                             # a flat picture: find its floor (PSDs have ground layers)
+            try:
+                floor = reference_objects.floor_mask(rgb, horizon, cache_dir, scene.get("stamp", str(image_path)))
+            except Exception as error:
+                missing.append("floor outline (%s)" % str(error)[:80])
+        hidden = _objects_mask(objects, H, W, floor)              # outlines: what really hides the floor
+        built_up = chosen in ("city", "interior")
+        # outdoors the ground's colours read best with whole boxes hidden (trunks, shadows under things)
+        grouping = hidden if built_up else _objects_mask(objects, H, W, None, boxes_only=True)
+        # streets and rooms: only the floor is ground (their walls reach below the horizon).  Outdoors the
+        # band below the horizon reads better: a floor outline there also takes in banks and shadow.
         surfaces = reference_surfaces.read_surfaces(rgb, _texture_rgb(scene, rgb), horizon, cache_dir,
-                                                    water_mask, hidden)
-        if surfaces and surfaces.get("extra_water") is not None and not water_grids:
+                                                    water_mask, grouping, allowed=rules["surfaces"], floor=floor,
+                                                    group_on_floor=built_up, floor_hidden=hidden)
+        extra = surfaces.get("extra_water") if surfaces else None
+        if extra is not None and not water_grids and real_water(extra, "bluish part of the ground") is not None:
             # plainly water, though the detector had no word for it
-            water_mask = surfaces["extra_water"]
+            water_mask = extra
             water_grids.append(_grid_from_mask(water_mask, WATER_GRID))
             atmosphere.setdefault("water", rl._hex(rgb[water_mask].mean(0)))
         if surfaces:
@@ -580,6 +745,7 @@ def build(result, image_path, cache_dir, keywords_path):
         "version": INVENTORY_VERSION, "source": source, "info": info,
         "objects": out_objects,
         "water": {"present": bool(water) and max(max(r) for r in water) > 0.25, "coverage": water,
+                  "checks": water_checks, "line": __import__("reference_water").line(water_checks),
                   "color": atmosphere.get("water") or "#3E7FA6", "tile": tile_path},
         "hills": {"coverage": _merge_grids(hill_grids)},
         "ground": ground, "sky": sky, "fog": atmosphere.get("fog"), "accent": atmosphere.get("accent"),
@@ -587,6 +753,8 @@ def build(result, image_path, cache_dir, keywords_path):
         "picture": {"W": W, "H": H, "horizon": horizon},
         "strokes": strokes,
         "surfaces": surfaces,
+        "setting": setting_info,
+        "picture_full": full_picture,
     }
 
 
@@ -596,7 +764,9 @@ def summary(inventory):
         rule = "seen once" if e["unique"] else "seen %d times" % e["count"]
         name = e["label"] if e.get("individual") else e["category"]
         lines.append("  %s: %s" % (name, rule))
-    if inventory.get("water", {}).get("present"):
+    if inventory.get("water", {}).get("line"):
+        lines.append("  " + inventory["water"]["line"])
+    elif inventory.get("water", {}).get("present"):
         lines.append("  water: pond / river basin")
     if inventory.get("hills", {}).get("coverage"):
         lines.append("  hills / mountains")

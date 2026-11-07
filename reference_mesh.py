@@ -55,20 +55,26 @@ GRID_LONG = 112          # silhouette resolution (long side, in cells)
 GRID_LOW = 18            # ... with Model style at Low poly
 TEXTURE_LONG = 1024      # art texture resolution (long side)
 RING_SIDES = 28          # sides of a lathe ring
-MESH_VERSION = "rwb-mesh-7"
+MESH_VERSION = "rwb-mesh-9"
 HERE = Path(__file__).resolve().parent
 
 LATHE = {"tower", "mushroom", "lantern", "pillar", "pine", "furniture"}
-SLAB = {"wall", "fence", "gate", "prop_card", "character", "creature", "floating", "house", "castle"}
+SLAB = {"wall", "fence", "gate", "prop_card", "character", "creature", "floating", "house", "castle",
+        "building", "sign", "vehicle"}
 GROUND = {"boat", "lily", "bridge"}
-ARCHITECTURE = {"tower", "castle", "house"}
+ARCHITECTURE = {"tower", "castle", "house", "building"}
+BLOCKS = {"building"}         # flat walls, square corners and a stepped roofline: modelled as "block"
+ROOF_STEP = 0.06              # roofline changes smaller than this share of the height are the same roof
 FOLIAGE = {"bush", "thorns", "flower", "grass"}
+# made things keep their own builder even with a rough outline: a lumpy sign is still flat
+MADE = {"sign", "vehicle", "building", "character", "pillar", "lantern", "gate", "wall", "fence", "prop_card"}
 ROUND_MIN_SYMMETRY = 0.68     # below this, spinning an outline makes a vase out of a lamp post
 UNSURE_QUALITY = 0.68         # the outline model's own confidence
 UNSURE_ROUGHNESS = 14.0       # a tangled outline (see reference_objects.roughness)
 # depth of a slab as a share of its width; buildings are deep, signs are thin
 SLAB_DEPTH = {"house": 0.45, "castle": 0.5, "wall": 0.14, "fence": 0.06, "gate": 0.14, "prop_card": 0.06,
-              "character": 0.16, "creature": 0.22, "floating": 0.08}
+              "character": 0.16, "creature": 0.22, "floating": 0.08, "building": 0.5, "sign": 0.05,
+              "vehicle": 0.45}
 # how far an inflated shape puffs out, relative to a perfectly round cross-section
 INFLATE_DEPTH = {"tree": 0.85, "bush": 0.9, "rock": 0.8, "cliff": 0.7, "log": 0.9, "thorns": 0.5,
                  "flower": 0.55, "grass": 0.35}
@@ -105,10 +111,12 @@ def choose_method(obj, grid, aspect):
         return obj["method"]
     if category in GROUND or category == "drawn":
         return method_for(category, aspect)
+    if category in BLOCKS:
+        return "block"
     if category in ARCHITECTURE:
         return "composite"
     unsure = (obj.get("quality", 1.0) < UNSURE_QUALITY or obj.get("roughness", 0.0) > UNSURE_ROUGHNESS)
-    if category in FOLIAGE or (unsure and category not in ("tree", "pine", "log", "prop_card")):
+    if category in FOLIAGE or (unsure and category not in ({"tree", "pine", "log"} | MADE)):
         return "cluster"
     wanted = method_for(category, aspect)
     if wanted == "lathe" and symmetry(grid) < ROUND_MIN_SYMMETRY:
@@ -292,6 +300,44 @@ def slab(mask, depth_ratio=0.15):
     return _shell(grid,
                   lambda r, c: (float(c), -float(profile[r, c]), float(h - 1 - r)),
                   lambda r, c: (float(c), float(profile[r, c]), float(h - 1 - r)))
+
+
+def block_outline(mask, step=ROOF_STEP):
+    """A building's outline squared off: flat ground line, straight sides, a roofline in level steps."""
+    h, w = mask.shape
+    cols = np.nonzero(mask.any(0))[0]
+    out = np.zeros_like(mask, bool)
+    if len(cols) < 2:
+        return mask.copy()
+    c0, c1 = int(cols.min()), int(cols.max())
+    tops = np.array([int(np.argmax(mask[:, c])) if mask[:, c].any() else h for c in range(c0, c1 + 1)], np.float64)
+    bottom = int(max(np.nonzero(mask[:, c])[0].max() for c in cols))
+    # ignore spikes (an aerial, a sign over the roof) narrower than a twelfth of the width
+    k = max(1, (c1 - c0 + 1) // 24)
+    padded = np.pad(tops, k, mode="edge")
+    tops = np.array([np.median(padded[i:i + 2 * k + 1]) for i in range(len(tops))])
+    height = max(1.0, bottom - tops.min())
+    steps = []
+    start = 0
+    for i in range(1, len(tops) + 1):
+        if i == len(tops) or abs(tops[i] - np.median(tops[start:i])) > step * height:
+            steps.append((start, i, int(round(np.median(tops[start:i])))))
+            start = i
+    for a, b, top in steps:
+        out[min(top, bottom):bottom + 1, c0 + a:c0 + b] = True
+    return out
+
+
+def block(mask, depth_ratio=0.5):
+    """A building: its squared-off outline extruded straight back, with sharp corners (no bevel)."""
+    grid = _pad(block_outline(mask))
+    h, w = grid.shape
+    columns = np.nonzero(grid.any(0))[0]
+    width = float(columns.max() - columns.min() + 1)
+    half = max(1.0, width * depth_ratio * 0.5)
+    return _shell(grid,
+                  lambda r, c: (float(c), -half, float(h - 1 - r)),
+                  lambda r, c: (float(c), half, float(h - 1 - r)))
 
 
 def lathe(mask, sides=RING_SIDES):
@@ -695,6 +741,8 @@ def build_object(obj, out_dir, camera, index):
         verts, faces = lathe(grid)
     elif method == "composite":
         verts, faces = composite(grid, SLAB_DEPTH.get(category, 0.45))
+    elif method == "block":
+        verts, faces = block(grid, SLAB_DEPTH.get(category, 0.5))
     elif method == "cluster":
         verts, faces = cluster(grid, seed=index + 1)
     elif method == "slab":
