@@ -1278,6 +1278,194 @@ def test_sketch():
 # --------------------------------------------------------------------------- #
 # live: real models, real Blender
 # --------------------------------------------------------------------------- #
+def _corner_picture(W=360, H=240, horizon=100.0, reach=300.0, corner_row=150.0, roof_row=20.0):
+    """A corner building facing you: two striped walls aiming at vanishing points reach px either side."""
+    cx = W / 2.0
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float64)
+    left = xs < cx
+    run = np.where(left, xs - (cx - reach), (cx + reach) - xs)          # distance from the wall's vanishing point
+    foot = horizon + (corner_row - horizon) * run / reach
+    roof = horizon - (horizon - roof_row) * run / reach
+    t = (ys - horizon) / np.maximum(run, 1.0)
+    stripe = (np.floor(t * reach / 6.0).astype(int) % 2) == 0
+    rgb = np.zeros((H, W, 3), np.uint8)
+    rgb[:] = (150, 190, 235)                                            # sky
+    wall = (ys >= roof) & (ys < foot)
+    rgb[wall & stripe & left] = (120, 70, 60)
+    rgb[wall & ~stripe & left] = (200, 160, 130)
+    rgb[wall & stripe & ~left] = (90, 60, 70)
+    rgb[wall & ~stripe & ~left] = (170, 140, 150)
+    floor = ys >= foot
+    rgb[floor] = (110, 110, 105)
+    return rgb, floor, foot
+
+
+def test_depth_and_buildings():
+    import reference_buildings as rb
+    import reference_layering as rly
+    import rwb_street
+    W, H, horizon, reach = 360, 240, 100.0, 300.0
+    rgb, floor, foot = _corner_picture(W, H, horizon, reach)
+    result = rb.frontage(rgb, horizon, floor)
+    buildings = result["buildings"]
+    check("a corner building is read as one building", len(buildings) == 1, result["line"])
+    faces = buildings[0]["faces"] if buildings else []
+    check("... with two walls", len(faces) == 2, [(f["a"], f["b"], f["slope"]) for f in faces])
+    if len(faces) == 2:
+        left, right = faces
+        check("the left wall turns away to the left, the right one to the right",
+              left["slope"] < -rb.TURNED and right["slope"] > rb.TURNED, (left["slope"], right["slope"]))
+        expected = rb.focal_for(W) / reach
+        check("the walls' directions come from their vanishing points",
+              abs(abs(left["slope"]) - expected) < 0.15 and abs(right["slope"] - expected) < 0.15,
+              (left["slope"], right["slope"], expected))
+        check("they meet at the corner", left["corner_right"] and right["corner_left"]
+              and abs(left["b"][0] - 0.5) < 0.04, left["b"])
+        worst = 0.0
+        for f in faces:
+            for u, v in (f["a"], f["b"]):
+                c = min(W - 1, int(u * W))
+                worst = max(worst, abs(v * H - foot[0, c]))
+        check("each wall stands on its painted foot line", worst < 3.0, worst)
+    truth = math.degrees(2 * math.atan((W / 2.0) / reach))
+    check("the corner's right angle gives the field of view", result["fov"] is not None and abs(result["fov"] - truth) < 4.0,
+          (result["fov"], truth))
+    shape = rb.street_or_corner(*rb.edge_directions(rgb, horizon), W)
+    check("a corner facing you isn't a street", not rb.is_street(shape) and shape["corner"] is not None, shape)
+    check("a street's sides aim at its middle", rb.is_street({"left": 1.0, "right": -0.8, "corner": None})
+          and not rb.is_street({"left": -0.3, "right": -0.4, "corner": None}))
+    check("level edges alone don't rule a street out", rb.is_street({"left": 0.0, "right": 0.0, "corner": None}))
+    ys, xs = np.mgrid[0:H, 0:W]
+    slanted = (128 + 100 * np.sin(2 * np.pi * (xs + ys * 0.6) / 12.0)).astype(np.uint8)[..., None].repeat(3, 2)
+    tilted = rb.frontage(slanted, horizon, floor)
+    check("a picture that isn't level reads no buildings", not tilted["buildings"], tilted["line"])
+    # the foot walks up through a road marking but not to a speck of 'floor' in a lit window
+    col = np.zeros((H, 1), bool)
+    col[150:] = True
+    col[140:146] = True                     # the floor beyond a 4-px marking
+    col[110:112] = True                     # a speck up in the shop window
+    got = rb.ground_line(col, horizon)[0]
+    check("the wall's foot is where the floor really ends", got == 140, got)
+    # bags in front of a wall: their feet are nearer, and the wall still stands on its own foot
+    bagged = floor.copy()
+    bags = (np.abs(np.arange(W) - 70) < 25)[None, :] & (np.arange(H)[:, None] < foot + 14)
+    bagged &= ~bags
+    again = rb.frontage(rgb, horizon, bagged)
+    lf = again["buildings"][0]["faces"][0] if again["buildings"] else None
+    if lf:
+        check("bags standing in front don't pull the wall forward",
+              abs(lf["a"][1] * H - foot[0, int(lf["a"][0] * W)]) < 4.0, (lf["a"], foot[0, int(lf["a"][0] * W)]))
+    else:
+        check("bags standing in front don't pull the wall forward", False, again["line"])
+
+    # ---- who stands in front of whom
+    Hh, Ww = 200, 160
+    disp = np.full((Hh, Ww), 0.2, np.float32)
+    near = np.zeros((Hh, Ww), bool)
+    near[130:190, 40:120] = True
+    far = np.zeros((Hh, Ww), bool)
+    far[60:130, 30:130] = True
+    disp[far] = 0.4
+    disp[near] = 0.8
+    items = [{"inst": {"id": "o00", "contact_v": 190 / 200.0}, "mask": near},
+             {"inst": {"id": "o01", "contact_v": 130 / 200.0, "depth_eye": 9.0}, "mask": far}]
+    check("the nearer outline is in front where they meet", rly.in_front(near, far, disp) == 1)
+    counts = rly.order(items, disp, Hh, 80.0, 140.0)
+    hidden = items[1]["inst"]
+    check("a thing standing on something nearer has hidden feet", hidden["feet_hidden"] and hidden["behind"] == ["o00"], hidden)
+    check("... and is behind that thing's foot", abs(hidden["behind_v"] - 0.95) < 1e-6, hidden.get("behind_v"))
+    check("the front one's feet show", not items[0]["inst"]["feet_hidden"])
+    check("everything gets a layer", counts["hidden"] == 1 and sum(counts[k] for k in ("near", "middle", "far")) == 2,
+          counts)
+    check("the panel says it", "hidden behind" in rly.line(counts))
+    cam = rwb_layout.PaintCamera(Ww, Hh, 80.0, 60.0, 160.0, 8000.0)
+    inst = {"contact_v": 0.65, "top_v": 0.3, "width_frac": 0.5, "feet_hidden": True, "behind_v": 0.95}
+    placed = cam.place(inst, "building")
+    low = cam.row_distance(0.95 * Hh) * rwb_layout.HIDDEN_BEHIND
+    high = cam.row_distance(0.65 * Hh)
+    check("hidden feet: placed between what hides them and where its visible bottom says",
+          low - 1e-6 <= placed["distance"] <= high + 1e-6 and placed["distance"] < high * 0.95, (low, placed["distance"], high))
+    plain = cam.place(dict(inst, feet_hidden=False), "building")
+    check("... which is nearer than its bottom alone says", placed["distance"] < plain["distance"])
+
+    # ---- the background plate: what stands in front is painted out
+    picture = np.zeros((40, 60, 3), np.float32)
+    picture[:] = (200, 30, 40)
+    hole = np.zeros((40, 60), bool)
+    hole[10:30, 20:40] = True
+    picture[hole] = (0, 255, 0)
+    filled = rly.fill(picture, hole)
+    check("the plate fills a hole from around it", np.abs(filled[hole] - (200, 30, 40)).max() < 2.0)
+    check("... and leaves the rest alone", np.allclose(filled[~hole], picture[~hole]))
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        src = tmp / "p.png"
+        pygame.image.save(pygame.image.frombuffer(picture.astype(np.uint8).tobytes(), (60, 40), "RGB"), str(src))
+        small = np.zeros((20, 30), bool)
+        small[5:15, 10:20] = True
+        made = rly.plate(src, small, tmp / "plate.png")
+        out = pygame.surfarray.array3d(pygame.image.load(made["path"])).transpose(1, 0, 2)
+        check("the saved plate has the thing painted out", abs(int(out[20, 30, 1]) - 30) < 10, out[20, 30])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- buildings in the world
+    for fov in (rb.fov_for(W, reach), 60.0):
+        wcam = rwb_layout.PaintCamera(W, H, horizon, fov, 160.0, 16000.0)
+        blocks = rwb_street.frontage_blocks(wcam, result)
+        worst = 0.0
+        for block in blocks:
+            for prism, face in zip(block["prisms"], buildings[0]["faces"]):
+                for point, uv in zip(prism["front"], (face["a"], face["b"])):
+                    u, v = rwb_street.image_uv(wcam, point[0], point[1], 0.0)
+                    worst = max(worst, abs(u - uv[0]) * W, abs(v - uv[1]) * H)
+        check("at %d deg the walls stand exactly on the painted foot lines" % round(fov), blocks and worst < 0.5, worst)
+    wcam = rwb_layout.PaintCamera(W, H, horizon, rb.fov_for(W, reach), 160.0, 16000.0)
+    block = rwb_street.frontage_blocks(wcam, result)[0]
+    (p, q), (pb, qb) = block["prisms"][0]["front"], block["prisms"][0]["back"]
+    check("a building runs back away from you", (wcam.player_y - pb[1]) > (wcam.player_y - p[1]))
+    a, b = block["prisms"][0]["front"][1], block["prisms"][1]["front"][0]
+    check("a corner building's walls share their corner", math.hypot(a[0] - b[0], a[1] - b[1]) < 1.0, (a, b))
+    mesh = rwb_street.prism_mesh(wcam, block)
+    check("a building block has painted fronts and plain sides", len(mesh["front"][0]) > 100 and len(mesh["plain"][1]) > 0)
+    turned = rwb_street.object_block(wcam, {"distance": 2000.0, "x": 0.0, "height": 900.0},
+                                     {"face_k": W / reach, "bbox_px": [120, 50, 240, 150]})
+    (p, q) = turned["prisms"][0]["front"]
+    check("a detected building faces the way its walls were painted (turned right: its right end further)",
+          (wcam.player_y - q[1]) > (wcam.player_y - p[1]) + 200.0, (p, q))
+    flat = rwb_street.object_block(wcam, {"distance": 2000.0, "x": 0.0, "height": 900.0},
+                                   {"face_k": 0.0, "bbox_px": [120, 50, 240, 150]})
+    (p, q) = flat["prisms"][0]["front"]
+    check("... and one painted facing you faces you", abs(p[1] - q[1]) < 1e-6)
+    wall = {"prisms": [{"front": ((-800.0, wcam.player_y - 1000.0), (800.0, wcam.player_y - 1000.0)),
+                        "back": ((-800.0, wcam.player_y - 2400.0), (800.0, wcam.player_y - 2400.0)), "height": 800.0}]}
+    sign = {"x": 100.0, "y": wcam.player_y - 2000.0, "distance": 2000.0, "z": 300.0, "height": 120.0, "width": 200.0,
+            "airborne": True}
+    before = rwb_street.image_uv(wcam, sign["x"], sign["y"], sign["z"])
+    check("a sign the depth map put inside a building comes onto its wall", rwb_street.snap_to_walls(wcam, [wall], sign)
+          and abs(sign["distance"] - 975.0) < 1e-6, sign)
+    after = rwb_street.image_uv(wcam, sign["x"], sign["y"], sign["z"])
+    check("... and still covers the part of the picture it was painted on",
+          abs(before[0] - after[0]) < 1e-6 and abs(before[1] - after[1]) < 1e-6, (before, after))
+    above = {"x": 0.0, "y": wcam.player_y - 3000.0, "distance": 3000.0, "z": 3000.0, "height": 500.0, "width": 300.0,
+             "airborne": True}
+    check("one painted above the roof stays behind the building", not rwb_street.snap_to_walls(wcam, [wall], above))
+
+    # ---- the world uses all of it
+    world = (HERE / "ReferenceWorldBuilder" / "Content" / "Python" / "rwb_world.py").read_text(encoding="utf-8")
+    check("the camera takes the field of view a corner gives (slider at its default)",
+          "def camera_fov(" in world and "DEFAULT_FOV" in world)
+    check("open-city buildings are built from their walls", "rwb_street.frontage_blocks(camera, frontage)" in world
+          and "rwb_street.object_block(" in world)
+    check("storefronts on those walls aren't built twice", 'not r["inst"].get("on_wall")' in world)
+    check("walls are painted from the plate", 'inv.get("plate")' in world)
+    facades = (HERE / "reference_facades.py").read_text(encoding="utf-8")
+    check("a corner building isn't taken for a street", "is_street(shape)" in facades)
+    inventory = (HERE / "reference_inventory.py").read_text(encoding="utf-8")
+    check("the inventory sorts near and far and reads the walls", "_depth_and_buildings(" in inventory
+          and "reference_buildings.frontage(" in inventory and "reference_layering.plate(" in inventory)
+
+
 def test_live(image):
     import reference_inventory
     import reference_scene
@@ -1348,7 +1536,7 @@ def main():
     for test in (test_camera, test_placement, test_ground_placement, test_filtering, test_masks, test_labels,
                  test_psd_names, test_mesh, test_ground_shape, test_end_to_end_no_blender,
                  test_clicks_are_queued, test_catalog, test_settings, test_buildings_and_signs, test_water_check, test_floor_finding, test_trees_and_style, test_surfaces, test_wading, test_progress_and_speed, test_shape_choice, test_outlines, test_water,
-                 test_read_strokes, test_quilt, test_bake, test_sketch):
+                 test_read_strokes, test_quilt, test_bake, test_sketch, test_depth_and_buildings):
         test()
     if args.live:
         test_live(Path(args.image) if args.image else default_image())

@@ -193,8 +193,23 @@ def street_layout(rgb, horizon, boxes=()):
     strips = {"left": sky[:h, : max(1, int(W * 0.2))], "right": sky[:h, int(W * 0.8):]}
     facade = {k: 1.0 - float(v.mean()) for k, v in strips.items()}
     street = upright >= MIN_UPRIGHT and min(facade.values()) >= MIN_SIDE_FACADE
+    # which way the walls run (reference_buildings): a street's sides aim at its middle; a corner
+    # building's walls aim outwards, and its two faces would make a nonsense street
+    shape = None
+    if street:
+        try:
+            import reference_buildings
+            shape = reference_buildings.street_or_corner(*reference_buildings.edge_directions(rgb, horizon, sky), W)
+        except Exception:
+            shape = None
     result = {"street": bool(street), "upright": round(upright, 3),
-              "facade": {k: round(v, 3) for k, v in facade.items()}, "sides": {}}
+              "facade": {k: round(v, 3) for k, v in facade.items()}, "sides": {}, "walls": shape}
+    if street and shape is not None and not reference_buildings.is_street(shape):
+        street = False
+        result["street"] = False
+        result["reason"] = ("a corner building faces you" if shape.get("corner") is not None
+                            else "the walls don't run down a street")
+        return result
     if not street:
         result["reason"] = ("the picture isn't level (upright edges %d%%)" % round(100 * upright)
                             if upright < MIN_UPRIGHT else "no buildings down both sides")

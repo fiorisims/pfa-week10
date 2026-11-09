@@ -70,6 +70,8 @@ SETTING_RULES = {
     "coast": {"terrain": 0.8, "grass": True, "forest": False, "box": False},
 }
 ON_THE_WALLS = {"building"}   # in a street, buildings are the walls themselves
+BLOCK_BUILDINGS = {"building"}   # elsewhere, each is a block facing the way its painted walls do
+DEFAULT_FOV = 60.0            # the panel's field of view at its default: the picture's own corner may say better
 SIGN_BOARDS = {"sign"}        # built as boards showing their own crop (rwb_street.build_boards)
 
 
@@ -525,7 +527,17 @@ def _picture_camera(inv, analysis, values, size):
     H = float(picture.get("H") or analysis.get("height") or 512)
     horizon = float(picture.get("horizon") or float(inv.get("horizon", 0.4)) * H)
     eye = 160.0 * float(values.get("object_scale", 1.0))
-    return rwb_layout.PaintCamera(W, H, horizon, float(values.get("fov", 60.0)), eye, size)
+    return rwb_layout.PaintCamera(W, H, horizon, camera_fov(inv, values)[0], eye, size)
+
+
+def camera_fov(inv, values):
+    """(field of view, read from the picture?).  A corner building's walls meet at right angles, which
+    gives the camera's field of view (reference_buildings); the panel's slider wins once it's moved."""
+    chosen = float(values.get("fov", DEFAULT_FOV))
+    read = (inv.get("depth") or {}).get("fov")
+    if read and abs(chosen - DEFAULT_FOV) < 0.01:
+        return float(read), True
+    return chosen, False
 
 
 def _place_for(camera, inst, category, method=None):
@@ -1267,6 +1279,24 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
             half = rwb_street.street_half_width([(r["place"]["x"], r["place"]["airborne"] or r["category"] == "sign")
                                                  for r in plan])
 
+    # an open city: the walls read from the picture are the buildings; the storefronts, doors and windows
+    # on them are part of their paint.  Other buildings become blocks facing the way they were painted.
+    frontage = (setting.get("layout") or {}).get("frontage") or {}
+    object_buildings = []
+    if not setting["box"]:
+        if frontage.get("buildings"):
+            plan = [r for r in plan if r.get("drawn") or not r["inst"].get("on_wall")]
+        found_keys = set(load_found(cache_dir))
+        object_buildings = [r for r in plan if r["category"] in BLOCK_BUILDINGS and not r.get("drawn")
+                            and r["inst"].get("cutout") and record_key(r) not in found_keys]
+        plan = [r for r in plan if r not in object_buildings]
+    fov, read_fov = camera_fov(inv, values)
+    if read_fov:
+        messages.append("camera: %d deg field of view, from where a building's walls meet" % round(fov))
+    depth = inv.get("depth") or {}
+    if depth.get("line"):
+        messages.append(depth["line"])
+
     # ---- new 3D models from the painting
     generated = {}
     camera_data = {"W": camera.W, "H": camera.H, "horizon": camera.horizon, "focal": camera.focal}
@@ -1327,11 +1357,36 @@ def build_world(analysis, values, root_dir, project_dir, keywords_path):
         "shapes": {k: unreal.load_asset(p) for k, p in rwb_layers.SHAPES.items()},
         "placer": Placer(size, heights, water_z, water, (0.0, camera.player_y)),
     }
+    scene = analysis.get("scene") or {}
+    # the picture with people, poles and cars painted out, so they aren't painted on the walls behind them
+    picture = next((p for p in (inv.get("plate"), inv.get("picture_full"), scene.get("texture"))
+                    if p and Path(p).is_file()), None)
+    if not setting["box"] and picture:
+        blocks = rwb_street.frontage_blocks(camera, frontage)
+        blocks += [rwb_street.object_block(camera, r["place"], r["inst"], n + 1) for n, r in enumerate(object_buildings)]
+        if blocks:
+            wb._progress_message("Building %d buildings from your picture" % len(blocks), 91.0)
+            try:
+                made = rwb_street.build_buildings(ctx, camera, blocks, picture, cache_dir, setting["night"])
+                read = [b for b in blocks if b["tag"].startswith("F")]
+                parts = []
+                if read:
+                    parts.append("%d standing where the picture shows their walls meet the ground (%d walls%s)" % (
+                        len(read), sum(b["walls"] for b in read),
+                        ", %d corner" % sum(1 for b in read if b["corner"]) if any(b["corner"] for b in read) else ""))
+                if len(blocks) > len(read):
+                    parts.append("%d more facing the way they were painted" % (len(blocks) - len(read)))
+                messages.append("buildings: %d, fronts painted from your picture: %s" % (len(made), "; ".join(parts)))
+            except Exception as error:
+                messages.append("could not build the buildings (%s)" % str(error)[:140])
+            # what the depth map put inside a building hangs on (or stands at) its wall instead
+            moved = sum(1 for r in plan + signs if not r.get("drawn") and rwb_street.snap_to_walls(camera, blocks, r["place"]))
+            if moved:
+                messages.append("%d things brought forward onto the building walls they were painted on" % moved)
+    elif object_buildings:
+        messages.append("buildings: no picture to paint them with")
     if half is not None:
         wb._progress_message("Building the street from your picture", 91.0)
-        scene = analysis.get("scene") or {}
-        picture = inv.get("picture_full") if inv.get("picture_full") and Path(inv["picture_full"]).is_file() \
-            else scene.get("texture")
         top_row = float(scene.get("sky_bottom") or 0.0) * camera.H / float(scene.get("height") or camera.H)
         blocks = rwb_street.building_blocks(camera, half, (setting.get("layout") or {}).get("sides"), seed)
         if picture and Path(picture).is_file():

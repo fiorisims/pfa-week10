@@ -2012,6 +2012,13 @@ def analyze_clicked(widget):
         night = "  |  night: lit signs become lights" if place.get("night") else ""
         _find(widget, "ReferenceInfo").set_text(str(_find(widget, "ReferenceInfo").get_text()) + "\n" + place["line"] + night)
         unreal.log("Reference World Builder: " + place["line"] + night)
+    # what stands in front of what, and the buildings read from their walls
+    depth = inventory.get("depth") or {}
+    extra = [line for line in (depth.get("buildings_line"), depth.get("line")) if line]
+    if extra:
+        _find(widget, "ReferenceInfo").set_text(str(_find(widget, "ReferenceInfo").get_text()) + "\n" + "\n".join(extra))
+        for line in extra:
+            unreal.log("Reference World Builder: " + line)
     values = _read_values(widget)
     if info and inventory and not values.get("exact_layout"):
         if inventory.get("error"):

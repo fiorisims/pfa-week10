@@ -25,6 +25,7 @@ MAX_GROUND_ASPECT = 2.6       # a lying object at most this much longer than it 
 # hidden feet: when the depth map says an object is this much nearer than where its visible
 # bottom would put it, something is covering its base and the depth map is right
 OCCLUDED_RATIO = 1.6
+HIDDEN_BEHIND = 1.1           # a thing with hidden feet stands at least this much further than what hides them
 FLAT_CATEGORIES = {"boat", "lily", "bridge"}  # modelled lying down (reference_mesh.GROUND)
 HORIZON_MARGIN = 0.012        # of the picture height: closer to the horizon than this is "at the far edge"
 
@@ -100,7 +101,14 @@ class PaintCamera:
             distance = depth_cm if depth_cm else self.row_distance(self.H * 0.9)
         else:
             distance = self.row_distance(contact_row)
-            if depth_cm and depth_cm * OCCLUDED_RATIO < distance:
+            near = None
+            if inst.get("feet_hidden") and inst.get("behind_v") is not None:
+                near = self.row_distance(float(inst["behind_v"]) * self.H) * HIDDEN_BEHIND
+            if near is not None and near < distance:
+                # its foot is hidden behind something nearer (reference_layering): it stands behind that
+                # thing, and no further than its visible bottom says; the depth map picks the spot between
+                distance = min(distance, max(near, depth_cm)) if depth_cm else math.sqrt(near * distance)
+            elif depth_cm and depth_cm * OCCLUDED_RATIO < distance:
                 distance = depth_cm
         distance = max(NEAREST_CM, min(self.far, distance))
         per_pixel = distance / self.focal

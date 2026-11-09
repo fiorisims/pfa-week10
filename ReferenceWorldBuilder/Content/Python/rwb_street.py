@@ -265,6 +265,212 @@ def block_mesh(camera, block, cols=12, rows=10):
 
 
 # --------------------------------------------------------------------------- #
+# buildings read from the picture's own walls (reference_buildings) and detected ones
+# --------------------------------------------------------------------------- #
+FRONTAGE_DEPTH_CM = 1400.0    # how deep a building runs behind the wall you can see
+MAX_MITER = 2.5               # a sharp corner's back point stays within this many depths
+OBJECT_DEPTH_CM = (500.0, 1400.0)
+MIN_WALL_CM = 30.0            # walls shorter than this along the ground are dropped
+
+
+def _ray(camera, u):
+    """Sideways run per unit of distance for picture column u."""
+    return (float(u) - 0.5) * camera.W / camera.focal
+
+
+def along_face(camera, p, q, u):
+    """Distance of the wall p-q (world x, y) seen at picture column u, or None."""
+    t = _ray(camera, u)
+    px, pd = p[0], camera.player_y - p[1]
+    qx, qd = q[0], camera.player_y - q[1]
+    ex, ed = qx - px, qd - pd
+    den = ex - t * ed
+    if abs(den) < 1e-9:
+        return None
+    s = (t * pd - px) / den
+    d = pd + s * ed
+    return d if d > 1.0 else None
+
+
+def wall_height(camera, p, q, roof, open_top):
+    """A wall's height from its painted roofline (cm), or up to the frame's top where it leaves the frame."""
+    far = max(camera.player_y - p[1], camera.player_y - q[1])
+    seen = camera.eye + camera.horizon * max(200.0, far) / camera.focal
+    if open_top or not roof:
+        return max(MIN_BUILDING_CM_HIGH, min(MAX_BUILDING_CM_HIGH, seen))
+    heights = []
+    for u, v in roof:
+        if v * camera.H <= 1.0:
+            continue                       # the roof is above the frame there
+        d = along_face(camera, p, q, u)
+        if d:
+            heights.append(camera.eye + (camera.horizon - v * camera.H) * d / camera.focal)
+    if not heights:
+        return max(MIN_BUILDING_CM_HIGH, min(MAX_BUILDING_CM_HIGH, seen))
+    heights.sort()
+    return max(MIN_BUILDING_CM_HIGH, min(MAX_BUILDING_CM_HIGH, heights[len(heights) // 2]))
+
+
+def _away(camera, p, q):
+    """Unit normal of the wall p-q pointing away from the start position."""
+    dx, dy = q[0] - p[0], q[1] - p[1]
+    length = math.hypot(dx, dy) or 1.0
+    n = (dy / length, -dx / length)
+    mid = ((p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0)
+    if n[0] * mid[0] + n[1] * (mid[1] - camera.player_y) < 0.0:
+        n = (-n[0], -n[1])
+    return n
+
+
+def back_line(camera, points, depth):
+    """The footprint's back: the front polyline pushed ``depth`` away from you, mitred at the corners."""
+    normals = [_away(camera, a, b) for a, b in zip(points[:-1], points[1:])]
+    back = []
+    for i, p in enumerate(points):
+        if i == 0 or i == len(points) - 1:
+            n = normals[0] if i == 0 else normals[-1]
+            back.append((p[0] + n[0] * depth, p[1] + n[1] * depth))
+            continue
+        a, b = normals[i - 1], normals[i]
+        dot = a[0] * b[0] + a[1] * b[1]
+        scale = depth / max(1e-3, 1.0 + dot)
+        ox, oy = (a[0] + b[0]) * scale, (a[1] + b[1]) * scale
+        length = math.hypot(ox, oy)
+        if length > MAX_MITER * depth:
+            ox, oy = ox * MAX_MITER * depth / length, oy * MAX_MITER * depth / length
+        back.append((p[0] + ox, p[1] + oy))
+    return back
+
+
+def _drop_tiny(points, faces):
+    keep_pts, keep_faces = [points[0]], []
+    for face, p in zip(faces, points[1:]):
+        if math.hypot(p[0] - keep_pts[-1][0], p[1] - keep_pts[-1][1]) >= MIN_WALL_CM:
+            keep_pts.append(p)
+            keep_faces.append(face)
+    return keep_pts, keep_faces
+
+
+def frontage_blocks(camera, frontage, depth=FRONTAGE_DEPTH_CM):
+    """One block per building reference_buildings read: [{tag, prisms, color, walls}], one prism per wall."""
+    out = []
+    for number, building in enumerate((frontage or {}).get("buildings") or []):
+        faces = building.get("faces") or []
+        if not faces:
+            continue
+        points = [camera.to_world(*faces[0]["a"])] + [camera.to_world(*f["b"]) for f in faces]
+        points, faces = _drop_tiny(points, faces)
+        if not faces:
+            continue
+        prisms = []
+        for i, face in enumerate(faces):
+            # each wall its own block straight back from it: they overlap inside a corner instead of
+            # folding over each other (mitring a deep back around a short cut-off corner makes spikes)
+            back = back_line(camera, [points[i], points[i + 1]], depth)
+            prisms.append({"front": (points[i], points[i + 1]), "back": (back[0], back[1]),
+                           "height": wall_height(camera, points[i], points[i + 1], face.get("roof"),
+                                                 face.get("open_top"))})
+        colours = [f.get("color") or (128, 128, 128) for f in faces]
+        out.append({"tag": "F%02d" % (number + 1), "prisms": prisms, "walls": len(faces),
+                    "color": [int(sum(c[k] for c in colours) / len(colours)) for k in range(3)],
+                    "corner": bool(building.get("corner"))})
+    return out
+
+
+def _colour_of(inst):
+    value = (inst.get("colors") or {}).get("avg") or (inst.get("colors") or {}).get("dominant")
+    if isinstance(value, str) and value.startswith("#") and len(value) == 7:
+        return [int(value[i:i + 2], 16) for i in (1, 3, 5)]
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        return [int(v) for v in value[:3]]
+    return [128, 128, 128]
+
+
+def object_block(camera, place, inst, number=1):
+    """A detected building as a block that faces the way its painted walls do (inst["face_k"])."""
+    distance, xc = place["distance"], place["x"]
+    s = float(inst.get("face_k") or 0.0) * camera.focal / camera.W     # depth gained per sideways step
+    box = inst.get("bbox_px")
+    if box:
+        u0, u1 = box[0] / camera.W, box[2] / camera.W
+    else:
+        half_w = float(inst.get("width_frac", 0.1)) / 2.0
+        u0, u1 = float(inst.get("centre_u", 0.5)) - half_w, float(inst.get("centre_u", 0.5)) + half_w
+    if any(1.0 - s * _ray(camera, u) < 0.1 for u in (u0, u1)):
+        s = 0.0                                 # the wall would run behind you: it faces you instead
+    points = []
+    for u in (u0, u1):
+        t = _ray(camera, u)
+        d = (distance - s * xc) / (1.0 - s * t)
+        points.append((t * d, camera.player_y - d))
+    width = math.hypot(points[1][0] - points[0][0], points[1][1] - points[0][1])
+    depth = max(OBJECT_DEPTH_CM[0], min(OBJECT_DEPTH_CM[1], width * 0.8))
+    back = back_line(camera, points, depth)
+    return {"tag": "B%02d" % number, "walls": 1, "color": _colour_of(inst), "corner": False,
+            "prisms": [{"front": tuple(points), "back": tuple(back),
+                        "height": max(MIN_BUILDING_CM_HIGH * 0.5, float(place["height"]))}]}
+
+
+def snap_to_walls(camera, blocks, place, gap=25.0, nearest=260.0):
+    """Something the depth map put inside a building (a sign on it, a window read as a machine) comes
+    forward along its line of sight to just in front of the wall: it covers the same part of the
+    picture, at the wall's distance.  Returns True when it moved.
+    """
+    x, y, distance = place["x"], place["y"], place["distance"]
+    u = 0.5 + x * camera.focal / (max(1.0, distance) * camera.W)
+    bottom_v = image_uv(camera, x, y, place.get("z", 0.0))[1]
+    wall = None
+    for block in blocks:
+        for prism in block["prisms"]:
+            (p, q), top = prism["front"], prism["height"]
+            d = along_face(camera, p, q, u)
+            if d is None or d >= distance - gap:
+                continue
+            # the line of sight must cross the wall itself, not where it would run on past its ends
+            hit = (_ray(camera, u) * d, camera.player_y - d)
+            lo, hi = min(p[0], q[0]) - 1.0, max(p[0], q[0]) + 1.0
+            lo_y, hi_y = min(p[1], q[1]) - 1.0, max(p[1], q[1]) + 1.0
+            if not (lo <= hit[0] <= hi and lo_y <= hit[1] <= hi_y):
+                continue
+            if bottom_v < image_uv(camera, hit[0], hit[1], top)[1]:
+                continue                       # painted above that roof: it stands behind the building
+            wall = d if wall is None else min(wall, d)
+    if wall is not None:
+        new = max(nearest, wall - gap)
+        ratio = new / distance
+        place["x"], place["y"], place["distance"] = x * ratio, camera.player_y - new, new
+        place["width"] = place["width"] * ratio
+        if place.get("airborne"):
+            place["z"] = camera.eye + (place["z"] - camera.eye) * ratio
+            place["height"] = place["height"] * ratio
+        else:
+            place["height"] = camera.eye + (place["height"] - camera.eye) * ratio   # same top in the picture
+        place["on_wall"] = True
+        return True
+    return False
+
+
+def prism_mesh(camera, block, cols=12, rows=10):
+    """A block's walls: fronts painted from the picture, roofs, backs and ends in its colour."""
+    fverts, fuvs, ftris = [], [], []
+    plain = []
+    for prism in block["prisms"]:
+        (p, q), (pb, qb), top = prism["front"], prism["back"], prism["height"]
+        verts = _quad_grid([(p[0], p[1], 0.0), (q[0], q[1], 0.0), (q[0], q[1], top), (p[0], p[1], top)], cols, rows)
+        base = len(fverts)
+        fverts += verts
+        fuvs += [tuple(min(1.0, max(0.0, v)) for v in image_uv(camera, *pt)) for pt in verts]
+        ftris += [base + i for i in _grid(verts, cols, rows)]
+        plain += [
+            [(p[0], p[1], top), (q[0], q[1], top), (qb[0], qb[1], top), (pb[0], pb[1], top)],      # roof
+            [(pb[0], pb[1], 0.0), (qb[0], qb[1], 0.0), (qb[0], qb[1], top), (pb[0], pb[1], top)],  # back
+            [(p[0], p[1], 0.0), (pb[0], pb[1], 0.0), (pb[0], pb[1], top), (p[0], p[1], top)],      # ends
+            [(q[0], q[1], 0.0), (qb[0], qb[1], 0.0), (qb[0], qb[1], top), (q[0], q[1], top)],
+        ]
+    return {"front": (fverts, fuvs, ftris), "plain": _two_sided(plain)}
+
+
+# --------------------------------------------------------------------------- #
 # signs as boards you can read
 # --------------------------------------------------------------------------- #
 BLADE_ASPECT = 1.6           # a sign this much taller than wide sticks out from its wall, facing down the street
@@ -476,8 +682,8 @@ def build_buildings(ctx, camera, blocks, picture_path, cache_dir, night=False):
     art = street_material(ctx, picture_path, cache_dir, night)
     made = []
     for block in blocks:
-        mesh = block_mesh(camera, block)
-        tag = "%s%02d" % ("L" if block["side"] == "left" else "R", block["number"])
+        mesh = prism_mesh(camera, block) if "prisms" in block else block_mesh(camera, block)
+        tag = block.get("tag") or "%s%02d" % ("L" if block["side"] == "left" else "R", block["number"])
         actor, component = _mesh_actor("RWBBuilding")
         verts, uvs, tris = mesh["front"]
         _section(component, 0, verts, tris, uvs)

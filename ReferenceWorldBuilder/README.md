@@ -79,9 +79,28 @@ picture with descriptions of each kind). The panel shows it after analysing, for
 camera: building corners upright, facades down both sides), each side is cut into separate buildings where the
 roofline jumps, the facade colour changes, or the detector boxed a building. Every building becomes its own
 block (`RWB_Building_L01`, `R02`...) with its own height from its painted roofline, a small setback, a flat roof and
-ends in its own colour, and a front painted from the picture. Cities that aren't a level street view (looking up,
-tilted, a skyline) are "open": each detected building becomes its own **block** model, a squared-off outline with
-flat walls and a stepped roofline (Blender keeps it square instead of smoothing it).
+ends in its own colour, and a front painted from the picture.
+
+**Buildings are read from their own walls.** A building's horizontal edges (rows of windows, roofs, kerbs) all aim
+at a vanishing point on the horizon, and where it lies says which way the wall faces: straight at you, turned left,
+turned right. Where the floor outline ends under the wall is where the wall stands. So in a city picture that isn't
+a street - a corner building on a crossing, a row of shop fronts facing you - each wall becomes a line on the
+ground with its real direction, and the walls that meet become one building (`RWB_Building_F01`...): its painted
+fronts, a roof and sides, standing exactly on the painted foot line. The same edges tell a corner building facing
+you from a street (in a street both sides aim at the middle; a corner's walls aim outwards), so a corner is never
+built as a corridor. A corner's two walls are at right angles, which gives the camera's **field of view**: while
+the panel's FOV slider is at its default (60) the build uses it, and says so. The storefronts, doors and windows
+standing on such a wall are part of its paint, not separate models; signs and anything the depth map put inside a
+building come forward onto its wall, covering the same spot. Other detected buildings become blocks
+(`RWB_Building_B01`...) facing the way their walls were painted. Tilted, looking-up pictures can't be read this
+way (their uprights aren't upright) and keep the detected buildings as blocks.
+
+**Foreground and background.** Wherever two outlines meet, the depth map says which one is in front. Something
+whose bottom rests on a nearer thing (a building behind a bus, a tree behind a fence) has hidden feet: it is placed
+behind that thing, at the depth map's distance, instead of where its visible bottom would put it. Everything gets a
+layer, shown in the panel after analysing: `Depth: 14 near, 10 in the middle, 1 far; 2 stand partly hidden behind
+others`. Walls and buildings are painted from a **background plate**, the picture with people, poles, bags and cars
+painted out, so a person isn't painted on the wall behind them as well as standing in front of it.
 
 **Signs and billboards are boards you can read.** Every sign the detector finds becomes its own model
 (`RWB_Sign_...`): a thin board with a dark frame whose face is a sharp crop of the sign from your full-resolution
@@ -355,6 +374,8 @@ plants and rocks guessed from the colours.
 - `../reference_setting.py` - what kind of place the picture is (nature, city, interior...), night and neon lights.
 - `../reference_facades.py` - is it a street? where each building along it starts and ends.
 - `../reference_water.py` - checks every water candidate before it becomes water you can wade into.
+- `../reference_buildings.py` - which way each wall faces (vanishing points), where it stands (the floor's edge), corners and the field of view.
+- `../reference_layering.py` - who stands in front of whom, hidden feet, near/middle/far, the background plate.
 - `Content/Python/rwb_street.py` - streets and rooms: building blocks, walls, sign boards, sign lights.
 - `../rwb_progress.py` - lets helper scripts move the panel's progress bar.
 - `../blender_refine.py` - runs inside Blender to finish each mesh.

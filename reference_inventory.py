@@ -35,7 +35,7 @@ import reference_layers as rl  # noqa: E402
 import reference_objects  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
-INVENTORY_VERSION = "rwb-inventory-5"
+INVENTORY_VERSION = "rwb-inventory-6"
 WATER_GRID = 72           # terrain follows the shore much better than the old 24 x 24 grid
 MAX_LAYER_LOOKS = 24      # PSD layers recognised from pixels per analysis (about 3 s each)
 GENERIC_MIN_SCORE = 0.15  # a "Layer 3" must look like something, or it is paint rather than an object
@@ -474,6 +474,93 @@ def add_boards(objects, image_path, cache_dir, W, H):
     return full
 
 
+FLUSH_WITH_WALLS = {"building", "furniture", "house", "prop_card"}   # a door read as a vending machine
+WALL_FOOT = 0.03          # of the height: standing this close to a wall's foot line = part of the wall
+
+
+def _instance_masks(objects, H, W):
+    """Every placed instance with its outline at the picture's work size."""
+    items = []
+    for entry in objects.values():
+        for inst in entry["instances"]:
+            box = inst.get("bbox_px") or inst.get("box")
+            if not box or "contact_v" not in inst:
+                continue
+            x0, y0, x1, y1 = [int(round(v)) for v in box]
+            x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+            if x1 - x0 < 2 or y1 - y0 < 2:
+                continue
+            outline = _cutout_alpha(inst.get("cutout"), x1 - x0, y1 - y0)
+            if outline is None:
+                outline = np.ones((y1 - y0, x1 - x0), bool)
+            mask = np.zeros((H, W), bool)
+            mask[y0:y1, x0:x1] = outline
+            items.append({"inst": inst, "mask": mask, "category": entry["category"]})
+    return items
+
+
+def wall_foot_v(frontage, u):
+    """Where a wall read by reference_buildings meets the ground at column u (a fraction), or None."""
+    for building in (frontage or {}).get("buildings") or []:
+        for face in building["faces"]:
+            (ua, va), (ub, vb) = face["a"], face["b"]
+            if ua <= u <= ub and ub > ua:
+                return va + (u - ua) / (ub - ua) * (vb - va)
+    return None
+
+
+def _depth_and_buildings(objects, rgb, horizon, disp, floor, full_picture, cache_dir, chosen, setting_info):
+    """Depth order and layers for every object; in an open city, the walls of the buildings; the plate."""
+    import reference_buildings
+    import reference_facades
+    import reference_layering
+    H, W = rgb.shape[:2]
+    items = _instance_masks(objects, H, W)
+    counts = reference_layering.order(items, disp, H, horizon, reference_buildings.focal_for(W))
+    info = {"counts": counts, "line": reference_layering.line(counts)}
+    layout = setting_info.get("layout") or {}
+    if chosen == "city" and not layout.get("street") and floor is not None:
+        blockers = np.zeros((H, W), bool)
+        for item in items:
+            if item["category"] not in ("building", "sign"):
+                blockers |= item["mask"]
+        front = reference_buildings.frontage(rgb, horizon, floor, blockers, disp)
+        layout["frontage"] = front
+        setting_info["layout"] = layout
+        info["buildings_line"] = front["line"]
+        if front.get("fov"):
+            info["fov"] = front["fov"]
+        for item in items:
+            inst = item["inst"]
+            u = float(inst.get("centre_u", inst.get("contact_u", 0.5)))
+            v = wall_foot_v(front, u)
+            if v is None:
+                continue
+            contact = float(inst["contact_v"])
+            if item["category"] == "building" and contact >= v - WALL_FOOT:
+                inst["on_wall"] = True                  # the storefront is that wall
+            elif item["category"] in FLUSH_WITH_WALLS and abs(contact - v) <= WALL_FOOT:
+                inst["on_wall"] = True                  # a door or a window in it
+        info["on_wall"] = sum(1 for item in items if item["inst"].get("on_wall"))
+    # which way every other building faces, for its block (rwb_street.object_block)
+    if any(item["category"] == "building" and not item["inst"].get("on_wall") for item in items):
+        directions = reference_buildings.edge_directions(rgb, horizon, reference_facades.sky_mask(rgb))
+        for item in items:
+            if item["category"] == "building" and not item["inst"].get("on_wall"):
+                item["inst"]["face_k"] = reference_buildings.object_face(*directions, item["mask"], W)
+    if full_picture and Path(full_picture).is_file():
+        standing = np.zeros((H, W), bool)
+        for item in items:
+            if item["category"] not in reference_layering.STANDING_ON_WALLS and not item["inst"].get("on_wall"):
+                standing |= item["mask"]
+        if standing.any():
+            info["plate"] = reference_layering.plate(full_picture, standing,
+                                                     Path(cache_dir).resolve() / "picture_plate.png")["path"]
+        else:
+            info["plate"] = full_picture
+    return info
+
+
 def build(result, image_path, cache_dir, keywords_path, setting=None):
     """The inventory of a picture.  setting: a reference_setting name, or None/"auto" to read it."""
     cache_dir = Path(cache_dir)
@@ -693,6 +780,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
 
     # what is the ground made of?  (never fatal: the terrain falls back to plain colours)
     surfaces = None
+    floor_found = None
     rwb_progress.report(0.86, "Reading the ground: grass, dirt, water")
     try:
         import reference_surfaces
@@ -700,6 +788,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
         if layers is None:                             # a flat picture: find its floor (PSDs have ground layers)
             try:
                 floor = reference_objects.floor_mask(rgb, horizon, cache_dir, scene.get("stamp", str(image_path)))
+                floor_found = floor
             except Exception as error:
                 missing.append("floor outline (%s)" % str(error)[:80])
         hidden = _objects_mask(objects, H, W, floor)              # outlines: what really hides the floor
@@ -722,6 +811,15 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
             surfaces["line"] = reference_surfaces.line(surfaces)
     except Exception as error:
         surfaces = {"error": str(error)[:200]}
+    # foreground and background: who stands in front of whom, and the buildings' own walls
+    depth_info = {}
+    if layers is None:
+        rwb_progress.report(0.88, "Sorting near and far, reading the buildings")
+        try:
+            depth_info = _depth_and_buildings(objects, rgb, horizon, disp, floor_found, full_picture, cache_dir,
+                                              chosen, setting_info)
+        except Exception as error:
+            missing.append("depth order (%s)" % str(error)[:80])
     water = _merge_grids(water_grids)
     tile_path = None
     if water:
@@ -755,6 +853,8 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
         "surfaces": surfaces,
         "setting": setting_info,
         "picture_full": full_picture,
+        "depth": depth_info,
+        "plate": depth_info.get("plate"),
     }
 
 
@@ -764,6 +864,10 @@ def summary(inventory):
         rule = "seen once" if e["unique"] else "seen %d times" % e["count"]
         name = e["label"] if e.get("individual") else e["category"]
         lines.append("  %s: %s" % (name, rule))
+    depth = inventory.get("depth") or {}
+    for key in ("line", "buildings_line"):
+        if depth.get(key):
+            lines.append("  " + depth[key])
     if inventory.get("water", {}).get("line"):
         lines.append("  " + inventory["water"]["line"])
     elif inventory.get("water", {}).get("present"):
