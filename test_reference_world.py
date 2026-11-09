@@ -173,10 +173,59 @@ def test_filtering():
     vocabulary = ro.load_queries(str(HERE / "rwb_layer_keywords.json"))
     check("the vocabulary knows umbrellas and carts",
           vocabulary.get("an umbrella") == "prop_card" and vocabulary.get("a hay cart") == "vehicle", vocabulary)
+    objects = [{"box": [1, 2, 30, 40], "label": "castle", "category": "castle"},
+               {"box": [50, 2, 80, 40], "label": "canoe", "category": "boat"},
+               {"box": [90, 2, 99, 40], "label": "tree", "category": "tree"}]
+    fixed = ro.apply_label_fixes(objects, {"1,2,30,40": {"category": "prop_card"}, "50,2,80,40": {"remove": True}})
+    check("a relabel changes that object, a removal drops it, others are untouched",
+          [o["category"] for o in fixed] == ["prop_card", "tree"] and fixed[0]["label"] == "prop card", fixed)
+    check("fixes leave the detector's own record alone", objects[0]["category"] == "castle")
+    with tempfile.TemporaryDirectory() as folder:
+        check("no fixes file means no fixes", ro.load_label_fixes(folder) == {})
+        ro.save_label_fixes(folder, {"1,2,30,40": {"remove": True}})
+        check("fixes round trip", ro.load_label_fixes(folder) == {"1,2,30,40": {"remove": True}})
+        test_review_window(Path(folder))
     # tiles map back into picture coordinates and cover the picture
     tiles = ro.tile_boxes(768, 548)
     check("tiles cover the picture", tiles[0][:2] == [0, 0] and tiles[-1][2] >= 767 and tiles[-1][3] >= 547, tiles)
     check("tiles overlap", tiles[0][2] > tiles[1][0], tiles)
+
+
+def test_review_window(folder):
+    """Drive the Check labels window under dummy SDL."""
+    import pygame
+    import reference_review as rr
+    pygame.init()
+    pygame.display.set_mode((64, 64))
+    pygame.image.save(pygame.Surface((400, 300)), str(folder / "scene_image.png"))
+    (folder / "label_fixes.json").unlink()
+    objects = [{"box": [0, 0, 200, 150], "label": "castle", "category": "castle", "score": 0.4, "bbox_frac": [0.0, 0.0, 0.5, 0.5]},
+               {"box": [20, 20, 60, 60], "label": "canoe", "category": "boat", "score": 0.2, "bbox_frac": [0.05, 0.05, 0.15, 0.2]}]
+    (folder / "recognized.json").write_text(json.dumps({"key": "x", "objects": objects, "areas": [], "info": ""}), encoding="utf-8")
+    app = rr.App(folder, folder)
+    canvas = app.canvas
+
+    def click(u, v):
+        app.handle(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1,
+                                      pos=(canvas.x + int(u * canvas.w), canvas.y + int(v * canvas.h))))
+    click(0.1, 0.1)
+    check("the smallest box under the cursor is picked", app.selected is app.items[1], app.selected)
+    app.remove()
+    click(0.4, 0.4)
+    check("the big box is reachable outside the small one", app.selected is app.items[0], app.selected)
+    app.set_category("prop_card")
+    app.draw()
+    check("corrections are held until Done", not (folder / "label_fixes.json").exists())
+    app.done()
+    saved = ro.load_label_fixes(folder)
+    check("Done saves a relabel and a removal", saved == {"0,0,200,150": {"category": "prop_card"}, "20,20,60,60": {"remove": True}}, saved)
+    check("applying them leaves the relabelled object", [o["category"] for o in ro.apply_label_fixes(objects, saved)] == ["prop_card"])
+    again = rr.App(folder, folder)
+    again.selected = again.items[0]
+    again.set_category("castle")
+    check("choosing the detected kind again clears the fix", again.items[0]["key"] not in again.fixes, again.fixes)
+    app.running = again.running = False
+    pygame.display.set_mode((64, 64))
 
 
 def test_masks():

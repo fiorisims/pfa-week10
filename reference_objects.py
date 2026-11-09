@@ -746,6 +746,44 @@ def save_cutout(texture, mask, bbox, path, work_size):
     return str(path)
 
 
+LABEL_FIXES = "label_fixes.json"
+
+
+def fix_key(obj):
+    """Identifies a detected object across re-analyses: detection is repeatable, so its box is too."""
+    return ",".join(str(int(round(v))) for v in obj["box"])
+
+
+def load_label_fixes(cache_dir):
+    """The artist's corrections: {fix_key: {"category": name} or {"remove": True}}."""
+    path = Path(cache_dir) / LABEL_FIXES
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_label_fixes(cache_dir, fixes):
+    path = Path(cache_dir) / LABEL_FIXES
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(fixes, indent=1, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def apply_label_fixes(objects, fixes):
+    """Objects with the artist's corrections applied; the cut-outs and placement stay as detected."""
+    out = []
+    for obj in objects:
+        fix = fixes.get(fix_key(obj)) or {}
+        if fix.get("remove"):
+            continue
+        if fix.get("category"):
+            obj = {**obj, "category": fix["category"], "label": fix["category"].replace("_", " ")}
+        out.append(obj)
+    return out
+
+
 def recognize(rgb, texture, cache_dir, stamp, keywords_path=None, disp=None, fit=None, horizon=None, focal=None,
               extra_queries=None):
     """Detect, outline and cut out everything in a painting (cached).

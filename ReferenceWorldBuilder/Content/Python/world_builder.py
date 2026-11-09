@@ -1427,6 +1427,58 @@ def poll_sketch():
         _draw["busy"] = False
 
 
+REVIEW_SCRIPT = ROOT_DIR / "reference_review.py"
+_review = {"process": None, "path": None, "before": None}
+
+
+def _read_or_none(path):
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def open_review(widget):
+    """Show what was recognised, boxed over the painting, so wrong labels are fixed before any model exists."""
+    analysis = _state.get("analysis") or {}
+    inventory = analysis.get("inventory") or {}
+    scene = analysis.get("scene") or {}
+    if inventory.get("source") != "detector" or not inventory.get("cache") or not scene.get("cache"):
+        _status(widget, "Analyze a flat picture first (PSD layers are labelled by their names).")
+        return
+    process = _review.get("process")
+    if process is not None and process.poll() is None:
+        _status(widget, "The Check labels window is already open.")
+        return
+    environment = os.environ.copy()
+    environment.pop("SDL_VIDEODRIVER", None)
+    environment["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+    _review["path"] = Path(inventory["cache"]) / "label_fixes.json"
+    _review["before"] = _read_or_none(_review["path"])
+    _review["process"] = subprocess.Popen(
+        [_system_python(), str(REVIEW_SCRIPT), "--scene", str(Path(scene["cache"]).resolve()),
+         "--inventory", str(Path(inventory["cache"]).resolve())],
+        cwd=str(ROOT_DIR), env=environment, creationflags=0x08000000 if os.name == "nt" else 0)
+    _ensure_tick()
+    _status(widget, "Check labels is open. Click a wrong box, fix it, then press Done.")
+
+
+def poll_review():
+    """Called from the tick: when the window closes with corrections, read the picture again."""
+    process = _review.get("process")
+    if process is None or process.poll() is None or _actions["running"] or _progress["task"] is not None:
+        return
+    _review["process"] = None
+    if _read_or_none(_review["path"]) == _review["before"]:
+        return
+
+    def run():
+        target = _current_widget()
+        if target:
+            analyze_clicked(target)
+    _queue_action("ReviewApply", run)
+
+
 def _build_world_from_scene(widget, analysis, values):
     """Single image: depth + perspective reconstruction (reference_scene.py)."""
     result = rwb_scene.build_world(analysis, values, SCENE_SCRIPT)
@@ -1510,6 +1562,10 @@ def _pie_tick(_delta):
         poll_sketch()
     except Exception as error:
         unreal.log_warning("Reference World Builder: sketch watcher: %s" % error)
+    try:
+        poll_review()
+    except Exception as error:
+        unreal.log_warning("Reference World Builder: label check watcher: %s" % error)
     if _is_commandlet() or not _state.get("reactions", True):
         return
     try:
@@ -1628,7 +1684,7 @@ def _clean_host_graph(asset):
 
 
 def _build_runtime_ui(widget, force=False):
-    if widget.find_child_widget_by_name("RWBTitle") and widget.find_child_widget_by_name("OwnLookBox") and not force:
+    if widget.find_child_widget_by_name("RWBTitle") and widget.find_child_widget_by_name("ReviewButton") and not force:
         return
     if widget.find_child_widget_by_name("RWBTitle"):
         force = True                    # an older panel saved in the asset: rebuild it with the new controls
@@ -1730,6 +1786,7 @@ def _build_runtime_ui(widget, force=False):
     )
     _check_row(widget, models, "KeepCopiesOut", "Keep added copies out of the painted view", False)
     _check_row(widget, models, "OwnLook", "Found models keep their own colours (instead of your painting's)", False)
+    _add(models, _button(widget, "ReviewButton", "Check labels before building...", "sky"), _margin(8, 4, 8, 2))
     _add(models, _button(widget, "DrawButton", "Draw a new shape...", "sky"), _margin(8, 4, 8, 6))
     _add(models, _new(unreal.VerticalBox, widget, "ModelList"))
 
@@ -1835,7 +1892,7 @@ def bind_widget(widget):
         _callbacks = {}
     rebound = []
     for name in ("BrowseButton", "AnalyzeButton", "GenerateButton", "ClearButton", "PlayButton", "StopButton", "DrawButton",
-                 "SettingButton"):
+                 "ReviewButton", "SettingButton"):
         button = _maybe(widget, name)
         if not button:
             continue
@@ -2121,6 +2178,7 @@ _BUTTON_ACTIONS.update({
     "PlayButton": play,
     "StopButton": stop,
     "DrawButton": open_sketch,
+    "ReviewButton": open_review,
     "SettingButton": cycle_setting,
 })
 

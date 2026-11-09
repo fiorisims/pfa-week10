@@ -684,6 +684,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
         water_mask = None
         if recognised is not None:
             found, areas, info = recognised
+            found = reference_objects.apply_label_fixes(found, reference_objects.load_label_fixes(cache_dir))
             source = "detector"
             if layers is not None:
                 info = "%s (nothing usable in the layers)" % info
@@ -840,7 +841,7 @@ def build(result, image_path, cache_dir, keywords_path, setting=None):
     top = rgb[: max(1, int(min(horizon, H * 0.3)))].reshape(-1, 3)
     sky = atmosphere.get("sky") or rl._hex(top.mean(0))
     return {
-        "version": INVENTORY_VERSION, "source": source, "info": info,
+        "version": INVENTORY_VERSION, "source": source, "info": info, "cache": str(cache_dir.resolve()),
         "objects": out_objects,
         "water": {"present": bool(water) and max(max(r) for r in water) > 0.25, "coverage": water,
                   "checks": water_checks, "line": __import__("reference_water").line(water_checks),
