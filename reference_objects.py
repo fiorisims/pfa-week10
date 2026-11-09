@@ -39,7 +39,7 @@ CLIP_REPO = "Xenova/clip-vit-base-patch32"
 CLIP_VISION = "onnx/vision_model_quantized.onnx"
 CLIP_TEXT = "onnx/text_model_quantized.onnx"
 CLIP_TOKENIZER = "tokenizer.json"
-RECOGNIZER_VERSION = "rwb-objects-12"
+RECOGNIZER_VERSION = "rwb-objects-13"
 OWL_SIZE = 960
 SAM_SIZE = 1024
 SCORE_MIN = 0.10          # below this OWLv2 is guessing, even on paintings
@@ -78,6 +78,8 @@ QUERIES = {
 }
 # area kinds shape the terrain instead of becoming objects
 AREA_CATEGORIES = {"water", "mountain"}
+GROUP_COVER = 0.6         # smaller boxes of one kind must fill this much of a box to make it a "group"
+GROUP_NEVER = AREA_CATEGORIES   # one body of water holds patches of water: it is still that body
 # these lie on the ground or water, so they cannot be above the horizon
 GROUNDED_CATEGORIES = {"boat", "lily", "bridge"}
 # these may hang or fly above the ground; anything else above the horizon is canopy or backdrop
@@ -167,13 +169,32 @@ def filter_boxes(scores, boxes, phrases, table, W, H, side, score_min=SCORE_MIN)
                for k in kept):
             continue
         kept.append(c)
-    # a box holding two or more of its own type is a "group" box, not one object
-    out = []
-    for c in kept:
-        inner = [k for k in kept if k is not c and k["category"] == c["category"] and _contains(c["box"], k["box"])]
-        if len(inner) < 2:
-            out.append(c)
-    return out
+    return [c for c in kept if not _is_group_box(c, kept)]
+
+
+def _covered_share(box, inner_boxes, cells=64):
+    """How much of ``box`` the union of ``inner_boxes`` covers (0-1), measured on a coarse grid."""
+    x0, y0, x1, y1 = box
+    width, height = max(1e-6, x1 - x0), max(1e-6, y1 - y0)
+    grid = np.zeros((cells, cells), bool)
+    for ix0, iy0, ix1, iy1 in inner_boxes:
+        left, right = int((ix0 - x0) / width * cells), int(np.ceil((ix1 - x0) / width * cells))
+        top, bottom = int((iy0 - y0) / height * cells), int(np.ceil((iy1 - y0) / height * cells))
+        grid[max(0, top):max(0, bottom), max(0, left):max(0, right)] = True
+    return float(grid.mean())
+
+
+def _is_group_box(candidate, kept):
+    """A box around several of its own kind, rather than one object of that kind.
+
+    Holding smaller boxes isn't enough: a man in the foreground overlaps little people down the
+    street, and a river holds patches of water.  They must also fill most of the box.
+    """
+    if candidate["category"] in GROUP_NEVER:
+        return False
+    inner = [k["box"] for k in kept if k is not candidate and k["category"] == candidate["category"]
+             and _contains(candidate["box"], k["box"])]
+    return len(inner) >= 2 and _covered_share(candidate["box"], inner) >= GROUP_COVER
 
 
 def _owl_run(rgb, ids, mask, session):
