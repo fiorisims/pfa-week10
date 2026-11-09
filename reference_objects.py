@@ -77,7 +77,7 @@ QUERIES = {
     "a mountain": "mountain",
 }
 # area kinds shape the terrain instead of becoming objects
-AREA_CATEGORIES = {"water", "mountain"}
+AREA_CATEGORIES = {"water", "mountain", "path", "ground"}
 GROUP_COVER = 0.6         # smaller boxes of one kind must fill this much of a box to make it a "group"
 GROUP_NEVER = AREA_CATEGORIES   # one body of water holds patches of water: it is still that body
 # these lie on the ground or water, so they cannot be above the horizon

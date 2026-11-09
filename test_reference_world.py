@@ -169,6 +169,10 @@ def test_filtering():
     check("a body of water is never a group of its patches", len(out) == 5, out)
     check("covered share adds up without double counting",
           near(ro._covered_share((0, 0, 100, 100), [(0, 0, 50, 100), (0, 0, 50, 100)]), 0.5, 0.02))
+    check("ground words are areas, never objects", {"path", "ground"} <= ro.AREA_CATEGORIES)
+    vocabulary = ro.load_queries(str(HERE / "rwb_layer_keywords.json"))
+    check("the vocabulary knows umbrellas and carts",
+          vocabulary.get("an umbrella") == "prop_card" and vocabulary.get("a hay cart") == "vehicle", vocabulary)
     # tiles map back into picture coordinates and cover the picture
     tiles = ro.tile_boxes(768, 548)
     check("tiles cover the picture", tiles[0][:2] == [0, 0] and tiles[-1][2] >= 767 and tiles[-1][3] >= 547, tiles)

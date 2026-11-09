@@ -392,7 +392,9 @@
         "sword",
         "shield",
         "signpost",
-        "sign post"
+        "sign post",
+        "umbrella",
+        "parasol"
       ]
     },
     "mountain": {
@@ -656,5 +658,24 @@
     "slab",
     "block"
   ],
-  "detector": {}
+  "detector": {
+    "an umbrella": "prop_card",
+    "a parasol": "prop_card",
+    "a cart": "vehicle",
+    "a hay cart": "vehicle",
+    "a wagon": "vehicle",
+    "a carriage": "vehicle",
+    "a horse": "creature",
+    "a dog": "creature",
+    "a cow": "creature",
+    "a sheep": "creature",
+    "a haystack": "bush",
+    "a windmill": "tower",
+    "a church": "house",
+    "a barn": "house",
+    "a sailboat": "boat",
+    "cobblestones": "path",
+    "a cobblestone street": "path",
+    "a dirt road": "path"
+  }
 }
